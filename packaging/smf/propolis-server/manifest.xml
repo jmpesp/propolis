@@ -17,6 +17,7 @@
   <method_context>
     <method_environment>
       <envvar name="LD_LIBRARY_PATH" value="/opt/ooce/pgsql-13/lib/amd64" />
+      <envvar name="RUST_BACKTRACE" value="full" />
     </method_environment>
   </method_context>
   <exec_method type='method' name='start'
