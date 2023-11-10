@@ -171,7 +171,7 @@ crucible-client-types = { path = "../crucible/crucible-client-types" }
 
 [patch."https://github.com/oxidecomputer/omicron"]
 #internal-dns = { path = "../omicron/internal-dns" }
-#nexus-client = { path = "../omicron/nexus-client" }
+nexus-client = { path = "../omicron/clients/nexus-client" }
 omicron-common = { path = "../omicron/common" }
 oximeter-producer = { path = "../omicron/oximeter/producer" }
 oximeter = { path = "../omicron/oximeter/oximeter" }
