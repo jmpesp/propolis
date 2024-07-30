@@ -184,3 +184,7 @@ omicron-uuid-kinds = { path = "../omicron/uuid-kinds" }
 #[patch."http://github.com/oxidecomputer/rfb"]
 #rfb = { path = "../rfb" }
 
+[patch."https://github.com/oxidecomputer/opte"]
+oxide-vpc = { path = "../opte/lib/oxide-vpc" }
+opte-ioctl = { path = "../opte/lib/opte-ioctl" }
+
