@@ -188,3 +188,8 @@ omicron-uuid-kinds = { path = "../omicron/uuid-kinds" }
 oxide-vpc = { path = "../opte/lib/oxide-vpc" }
 opte-ioctl = { path = "../opte/lib/opte-ioctl" }
 
+[patch."https://github.com/oxidecomputer/propolis"]
+bhyve_api = { path = "crates/bhyve-api" }
+propolis-client = { path = "lib/propolis-client" }
+propolis-mock-server = { path = "bin/mock-server" }
+
