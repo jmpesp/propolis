@@ -90,7 +90,7 @@ crucible = { git = "https://github.com/oxidecomputer/crucible", rev = "d2d8f8ad4
 crucible-client-types = { git = "https://github.com/oxidecomputer/crucible", rev = "d2d8f8ad449df7e2befb7ee2723a442dd74b9b72" }
 
 # External dependencies
-anyhow = "1.0"
+anyhow = "1"
 async-trait = "0.1.53"
 atty = "0.2.14"
 backoff = "0.4.0"
@@ -173,6 +173,19 @@ tracing-subscriber = "0.3.14"
 usdt = { version = "0.5", default-features = false }
 uuid = "1.3.2"
 zerocopy = "0.7.34"
+
+[patch."https://github.com/oxidecomputer/daft"]
+daft = { path = "../daft/daft" }
+daft-derive = { path = "../daft/daft-derive" }
+[patch.crates-io.daft]
+path = "../daft/daft"
+[patch.crates-io.daft-derive]
+path = "../daft/daft-derive"
+
+[patch."https://github.com/oxidecomputer/oxnet"]
+oxnet = { path = "../oxnet" }
+[patch.crates-io.oxnet]
+path = "../oxnet"
 
 [patch."https://github.com/oxidecomputer/crucible"]
 crucible = { path = "../crucible/upstairs" }
