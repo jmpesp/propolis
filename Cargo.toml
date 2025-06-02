@@ -185,13 +185,15 @@ crucible = { path = "../crucible/upstairs" }
 crucible-client-types = { path = "../crucible/crucible-client-types" }
 
 [patch."https://github.com/oxidecomputer/omicron"]
-internal-dns = { path = "../omicron/internal-dns" }
+internal-dns-resolver = { path = "../omicron/internal-dns/resolver" }
+internal-dns-types = { path = "../omicron/internal-dns/types" }
 nexus-client = { path = "../omicron/clients/nexus-client" }
 omicron-common = { path = "../omicron/common" }
 oximeter-instruments = { path = "../omicron/oximeter/instruments" }
 oximeter-producer = { path = "../omicron/oximeter/producer" }
 oximeter = { path = "../omicron/oximeter/oximeter" }
 omicron-uuid-kinds = { path = "../omicron/uuid-kinds" }
+sled-agent-client = { path = "../omicron/clients/sled-agent-client" }
 
 #[patch."http://github.com/oxidecomputer/rfb"]
 #rfb = { path = "../rfb" }
