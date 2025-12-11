@@ -459,8 +459,9 @@ struct DeviceAttachInner {
 
 /// Main "attachment point" for a block device.
 pub struct DeviceAttachment(Arc<DeviceAttachInner>);
+
 impl DeviceAttachment {
-    /// Create a [DeviceAttachment] for a given device.  The maximum number of
+    /// Create a [DeviceAttachment] for a given device. The maximum number of
     /// queues which the device will ever expose is set via `max_queues`.  DMA
     /// done by attached backend workers will be through the provided `acc_mem`.
     pub fn new(max_queues: NonZeroUsize, acc_mem: MemAccessor) -> Self {
