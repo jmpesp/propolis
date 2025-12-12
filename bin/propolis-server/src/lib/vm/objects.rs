@@ -374,12 +374,12 @@ impl VmObjectsLocked {
     async fn halt_devices(&self) {
         // Take care not to wedge the runtime with any device halt
         // implementations which might block.
-        tokio::task::block_in_place(|| {
-            self.for_each_device(|name, dev| {
+        tokio::task::block_in_place(|| async {
+            for (name, dev) in self.devices.iter() {
                 info!(self.log, "sending halt request to {}", name);
-                dev.halt();
-            });
-        });
+                dev.halt().await;
+            }
+        }).await;
 
         /*
         for (id, backend) in self.block_backends.iter() {

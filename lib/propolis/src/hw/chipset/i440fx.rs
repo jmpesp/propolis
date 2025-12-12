@@ -1009,7 +1009,7 @@ impl Lifecycle for Piix3PM {
         self.pmtimer.resume();
     }
     async fn start(&self) -> anyhow::Result<()> {
-        self.pmtimer.start();
+        self.pmtimer.start().await?;
         Ok(())
     }
     fn migrate(&self) -> Migrator<'_> {

@@ -162,6 +162,10 @@ impl block::Backend for InMemoryBackend {
         self.worker_count
     }
 
+    fn synchronous(&self) -> bool {
+        true
+    }
+
     async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
         if let Err(e) = self.spawn_workers(workers) {
             self.workers.block_until_joined();

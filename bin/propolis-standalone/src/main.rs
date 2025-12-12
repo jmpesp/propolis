@@ -17,7 +17,7 @@ use clap::Parser;
 use futures::future::BoxFuture;
 use propolis::hw::qemu::pvpanic::QemuPvpanic;
 use propolis_types::{CpuidIdent, CpuidValues, CpuidVendor};
-use slog::{o, Drain};
+use slog::{o, Drain, info};
 use strum::IntoEnumIterator;
 use tokio::runtime;
 
@@ -232,11 +232,6 @@ impl Inventory {
         self.block.insert(name, be.clone());
     }
     fn destroy(&mut self) {
-        // Detach all block backends from their devices
-        for backend in self.block.values() {
-            backend.stop();
-        }
-
         // Drop all refs in the hopes that things can clean up after themselves
         self.devs.clear();
         self.block.clear();
@@ -321,22 +316,29 @@ impl Instance {
         state: State,
         guard: &MutexGuard<InstState>,
         first_boot: bool,
-        _log: &slog::Logger,
+        log: &slog::Logger,
     ) {
         for (name, device) in guard.inventory.devs.iter() {
             match state {
                 State::Run => {
                     if first_boot {
-                        device.start().unwrap_or_else(|_| {
+                        info!(log, "starting {name}");
+                        tokio::runtime::Handle::current().block_on(async {
+                            device.start().await
+                        }).unwrap_or_else(|_| {
                             panic!("device {name} failed to start")
                         });
+                        info!(log, "started {name}");
                     } else {
                         device.resume();
                     }
                 }
-                // XXX here
                 State::Quiesce => device.pause(),
-                State::Halt => device.halt(),
+                State::Halt => {
+                    tokio::runtime::Handle::current().block_on(async {
+                        device.halt().await
+                    });
+                }
                 State::Reset => device.reset(),
                 _ => panic!("invalid device state transition {state:?}"),
             }

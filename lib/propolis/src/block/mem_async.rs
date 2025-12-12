@@ -28,6 +28,7 @@ struct SharedState {
 }
 impl SharedState {
     async fn processing_loop(&self, wctx: block::AsyncWorkerCtx) {
+        eprintln!("wctx {} processing loop, waiting for request", wctx.id());
         while let Some(dreq) = wctx.next_req().await {
             let req = dreq.req();
             if self.info.read_only && req.op.is_write() {
@@ -155,6 +156,10 @@ impl block::Backend for MemAsyncBackend {
 
     fn worker_count(&self) -> NonZeroUsize {
         self.worker_count
+    }
+
+    fn synchronous(&self) -> bool {
+        false
     }
 
     async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {

@@ -499,6 +499,7 @@ impl super::Enlightenment for HyperV {
     }
 }
 
+#[async_trait::async_trait]
 impl Lifecycle for HyperV {
     fn type_name(&self) -> &'static str {
         TYPE_NAME
@@ -574,7 +575,7 @@ impl Lifecycle for HyperV {
         inner.reset();
     }
 
-    fn halt(&self) {
+    async fn halt(&self) {
         let inner = self.inner.lock().unwrap();
         assert!(inner.overlay_manager.is_empty());
     }

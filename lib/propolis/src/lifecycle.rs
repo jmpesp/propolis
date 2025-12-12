@@ -81,7 +81,7 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// discarded.
     ///
     /// N.B. The state driver ensures this is called only on paused devices.
-    fn halt(&self) {}
+    async fn halt(&self) {}
 
     /// Return the Migrator object that will be used to export/import
     /// this device's state.

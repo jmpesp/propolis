@@ -370,6 +370,10 @@ impl block::Backend for CrucibleBackend {
         WORKER_COUNT
     }
 
+    fn synchronous(&self) -> bool {
+        false
+    }
+
     async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
         self.state.volume.activate().await?;
         self.spawn_workers(workers);

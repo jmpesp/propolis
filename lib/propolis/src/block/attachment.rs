@@ -20,13 +20,13 @@ use std::future::Future;
 use std::marker::PhantomPinned;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use super::minder::{NoneInFlight, QueueMinder};
 use super::{
-    devq_id, probes, DeviceId, DeviceInfo, DeviceQueue, DeviceRequest,
+    DeviceId, DeviceInfo, DeviceQueue, DeviceRequest,
     MetricConsumer, QueueId, WorkerId,
 };
 use crate::accessors::MemAccessor;
@@ -34,10 +34,6 @@ use crate::accessors::MemAccessor;
 use futures::stream::FuturesUnordered;
 use futures::Stream;
 use pin_project_lite::pin_project;
-use strum::IntoStaticStr;
-use thiserror::Error;
-use tokio::sync::futures::Notified;
-use tokio::sync::Notify;
 
 /// Static for generating unique block [DeviceId]s with a process
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(0);
@@ -115,9 +111,7 @@ pub type OnAttachFn = Box<dyn Fn(DeviceInfo) + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct DeviceState {
-    on_attach: Option<OnAttachFn>,
     queues: BTreeMap<QueueId, Arc<QueueMinder>>,
-    paused: bool,
 }
 
 struct DeviceAttachInner {
@@ -180,13 +174,14 @@ impl DeviceAttachment {
     ) -> Self {
         let (notify_tx, notify_rx) = std::sync::mpsc::channel(); // XXX max queues bound
         let max_workers = backend.worker_count();
+        let synchronous = backend.synchronous();
 
         let inner = Arc::new(DeviceAttachInner {
             dev_state: Mutex::new(DeviceState::default()),
             acc_mem,
             device_id: NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed),
             max_queues,
-            workers: WorkerCollection::new(max_workers),
+            workers: WorkerCollection::new(max_workers, synchronous),
             backend,
             notify_tx,
         });
@@ -201,7 +196,8 @@ impl DeviceAttachment {
             .name(format!("device {device_id} notify"))
             .spawn(move || {
                 device_notify_worker(also_myself, notify_rx);
-            });
+            })
+            .unwrap();
 
         myself
     }
@@ -256,8 +252,8 @@ impl DeviceAttachment {
         self.0.notify_tx.send(DeviceAttachmentNotify::NewRequests { queue_id, hint }).unwrap();
     }
 
-    fn notify_impl(&self, queue_id: QueueId, hint: ReqCountHint) {
-        let mut state = self.0.dev_state.lock().unwrap();
+    fn notify_impl(&self, queue_id: QueueId, _hint: ReqCountHint) {
+        let state = self.0.dev_state.lock().unwrap();
 
         let Some(minder) = state.queues.get(&queue_id) else {
             // XXX queue disassociated?
@@ -265,7 +261,7 @@ impl DeviceAttachment {
         };
 
         while let Some(req) = minder.next_req() {
-            // XXX send it!
+            self.0.workers.send_req(WorkerMessage::Request { req });
         }
     }
 
@@ -300,10 +296,10 @@ impl DeviceAttachment {
         self.0.notify_tx.send(DeviceAttachmentNotify::Resume).unwrap();
     }
 
-    pub fn halt(&self) {
+    pub async fn halt(&self) {
         // XXX specific order: stop threads, wait for threads to join
         self.0.workers.stop();
-        self.0.backend.stop();
+        self.0.backend.stop().await;
     }
 
     /// Emit a [Future] which will resolve when there are no request being
@@ -345,7 +341,7 @@ impl Drop for DeviceAttachment {
     }
 }
 
-enum WorkerMessage {
+pub enum WorkerMessage {
     Request { req: DeviceRequest },
 
     Stop,
@@ -374,7 +370,7 @@ impl WorkerSlot {
 
     /// Called by Sync workers to block for a request
     fn block_for_req(&self) -> Option<DeviceRequest> {
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         assert!(state.active_type.is_some());
 
         let Some(WorkerType::Sync { rx, .. }) = &state.active_type else {
@@ -409,6 +405,7 @@ impl WorkerSlot {
             rx.clone()
         };
 
+        eprintln!("id {} waiting for request", self.id);
         match rx.recv().await {
             Ok(message) => match message {
                 WorkerMessage::Request { req } => Some(req),
@@ -425,7 +422,7 @@ impl WorkerSlot {
     // XXX halt processing once they have completed any in-flight work.
     /// Causes all worker threads to stop their loops and terminate
     fn stop(&self) {
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let Some(active_type) = &state.active_type else {
             panic!("halting non-active worker!");
         };
@@ -447,9 +444,11 @@ impl WorkerSlot {
     }
 }
 
-pub(crate) struct WorkerCollection {
+pub struct WorkerCollection {
     workers: Vec<WorkerSlot>,
+    sync: bool,
 
+    // XXX wrap in enum
     sync_tx: crossbeam::channel::Sender<WorkerMessage>,
     sync_rx: crossbeam::channel::Receiver<WorkerMessage>,
 
@@ -458,7 +457,7 @@ pub(crate) struct WorkerCollection {
 }
 
 impl WorkerCollection {
-    fn new(max_workers: NonZeroUsize) -> Arc<Self> {
+    fn new(max_workers: NonZeroUsize, sync: bool) -> Arc<Self> {
         let max_workers = max_workers.get();
         assert!(max_workers <= MAX_WORKERS.get());
         let workers: Vec<_> = (0..max_workers)
@@ -471,11 +470,20 @@ impl WorkerCollection {
 
         Arc::new(Self {
             workers,
+            sync,
             sync_tx,
             sync_rx,
             async_tx,
             async_rx,
         })
+    }
+
+    fn send_req(&self, req: WorkerMessage) {
+        if self.sync {
+            self.sync_tx.send(req);
+        } else {
+            self.async_tx.send_blocking(req);
+        }
     }
 
     fn set_active_sync(&self, id: WorkerId, active: bool) -> bool {
@@ -602,6 +610,10 @@ impl InactiveWorkerCtx {
 /// vacant, and available to be activated again.
 pub struct SyncWorkerCtx(WorkerCtxInner);
 impl SyncWorkerCtx {
+    pub fn id(&self) -> WorkerId {
+        self.0.id
+    }
+
     /// Block (synchronously) in order to retrieve the next
     /// [request](DeviceRequest) from the device.  Will return [None] if no
     /// device is attached, or the backend is stopped, otherwise it will block
@@ -622,6 +634,10 @@ impl SyncWorkerCtx {
 /// vacant, and available to be activated again.
 pub struct AsyncWorkerCtx(WorkerCtxInner);
 impl AsyncWorkerCtx {
+    pub fn id(&self) -> WorkerId {
+        self.0.id
+    }
+
     /// Get a [Future] which will wait for a [request](DeviceRequest) to be made
     /// available from an attached device.
     pub async fn next_req(&self) -> Option<DeviceRequest> {

@@ -595,7 +595,7 @@ impl StateDriver {
         // Send synchronous start commands to all devices.
         for (name, dev) in objects.device_map() {
             info!(self.log, "sending start request to {}", name);
-            let res = dev.start();
+            let res = dev.start().await;
             if let Err(e) = res {
                 error!(
                     self.log, "device start() returned an error";

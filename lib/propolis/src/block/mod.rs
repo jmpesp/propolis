@@ -144,19 +144,6 @@ impl QueueId {
     pub const MAX_QUEUES: usize = 64;
 
     pub const MAX: Self = Self(Self::MAX_QUEUES as u8);
-
-    /// Get the next sequential QueueId, wrapping around at a maximum
-    fn next(self, max: usize) -> Self {
-        let max: u8 = max.try_into().expect("max should be in-range");
-        assert!(max != 0 && max <= Self::MAX.0);
-
-        let next = self.0.wrapping_add(1);
-        if next >= max {
-            Self(0)
-        } else {
-            Self(next)
-        }
-    }
 }
 impl From<usize> for QueueId {
     fn from(value: usize) -> Self {
@@ -286,6 +273,9 @@ pub trait Backend: Send + Sync + 'static {
 
     // XXX
     fn worker_count(&self) -> NonZeroUsize;
+
+    // XXX
+    fn synchronous(&self) -> bool;
 
     /// Start attempting to process [Request]s from [Device] (if attached) XXX
     ///

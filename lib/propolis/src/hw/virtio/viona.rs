@@ -537,7 +537,7 @@ impl Lifecycle for PciVirtioViona {
             self.virtio_state.set_needs_reset(self);
         }
     }
-    fn halt(&self) {
+    async fn halt(&self) {
         self.poller_stop(true);
         // Destroy any in-kernel state to prevent it from impeding instance
         // destruction.

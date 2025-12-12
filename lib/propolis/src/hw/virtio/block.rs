@@ -330,8 +330,8 @@ impl Lifecycle for PciVirtioBlock {
         self.virtio_state.reset(self);
     }
 
-    fn halt(&self) {
-        self.block_attach.halt();
+    async fn halt(&self) {
+        self.block_attach.halt().await;
     }
 
     fn migrate(&self) -> Migrator<'_> {

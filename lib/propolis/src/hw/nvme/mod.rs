@@ -6,7 +6,7 @@ use std::convert::TryInto;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::accessors::Guard;
 use crate::block;
@@ -1400,8 +1400,8 @@ impl Lifecycle for PciNvme {
         self.pci_state.reset(self);
     }
 
-    fn halt(&self) {
-        self.block_attach.halt();
+    async fn halt(&self) {
+        self.block_attach.halt().await;
     }
 
     fn migrate(&self) -> Migrator<'_> {

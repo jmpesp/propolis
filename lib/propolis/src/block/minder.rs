@@ -18,7 +18,7 @@ use tokio::sync::futures::Notified;
 use tokio::sync::Notify;
 
 use crate::block::{self, devq_id, probes, Operation, Request};
-use crate::block::{DeviceId, MetricConsumer, QueueId, WorkerId};
+use crate::block::{DeviceId, MetricConsumer, QueueId};
 
 /// Each emulated block device will have one or more [DeviceQueue]s which can be
 /// polled through [next_req()](DeviceQueue::next_req()) to emit IO requests.

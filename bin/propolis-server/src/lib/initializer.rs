@@ -669,7 +669,7 @@ impl MachineInitializer<'_> {
                     };
 
                     // Limit data transfers to 1MiB (2^8 * 4k) in size
-                    let mdts = Some(8);
+                    let mdts = Some(8); // XXX
                     let component = format!("nvme-{device_id}");
                     let nvme = nvme::PciNvme::create(
                         &nvme_spec.serial_number,
@@ -720,7 +720,7 @@ impl MachineInitializer<'_> {
 
                 if let Some(registry) = &self.producer_registry {
                     let block_metrics = BlockMetrics::new(
-                        VirtualDisk {
+                        VirtualDisk { // XXX
                             attached_instance_id: self.properties.id,
                             block_size,
                             disk_id: volume_id,
