@@ -17,7 +17,6 @@ use pin_project_lite::pin_project;
 use tokio::sync::futures::Notified;
 use tokio::sync::Notify;
 
-use crate::block::attachment::Bitmap;
 use crate::block::{self, devq_id, probes, Operation, Request};
 use crate::block::{DeviceId, MetricConsumer, QueueId, WorkerId};
 
@@ -113,11 +112,6 @@ struct QmEntry {
 
 struct QmInner {
     next_id: ReqId,
-    /// Map of [WorkerId]s which we emitted [None] to via
-    /// [QueueMinder::next_req()] and which are likely candidates to notify when
-    /// this queue has new entries.
-    notify_workers: Bitmap,
-    paused: bool,
     in_flight: BTreeMap<ReqId, QmEntry>,
     metric_consumer: Option<Arc<dyn MetricConsumer>>,
     /// Number of [Request] completions which are currently being processed by
@@ -126,12 +120,11 @@ struct QmInner {
     /// [NoneInFlight].
     processing_last: usize,
 }
+
 impl Default for QmInner {
     fn default() -> Self {
         Self {
             next_id: ReqId::START,
-            notify_workers: Bitmap::default(),
-            paused: false,
             processing_last: 0,
             in_flight: BTreeMap::new(),
             metric_consumer: None,
@@ -156,7 +149,7 @@ impl QueueMinder {
         queue: Arc<DQ>,
         device_id: DeviceId,
         queue_id: QueueId,
-    ) -> Arc<Self> {
+    ) -> Arc<Self> { // XXX needs to be Arc for NoneProcessing?
         let next_req_queue = queue.clone();
         let next_req_fn: NextReqFn = Box::new(move || {
             let (req, token, when_queued) = next_req_queue.next_req()?;
@@ -188,17 +181,9 @@ impl QueueMinder {
     }
 
     /// Attempt to fetch the next IO request from this queue for a worker.
-    ///
-    /// If no requests are available, that worker (specified by `wid`) will be
-    /// recorded so it can be notified if/when the guest notifies this queue
-    /// that more requests are available.
-    pub fn next_req(&self, wid: WorkerId) -> Option<DeviceRequest> {
-        let mut state = self.state.lock().unwrap();
-        if state.paused {
-            state.notify_workers.set(wid);
-            return None;
-        }
+    pub fn next_req(&self) -> Option<DeviceRequest> {
         if let Some((req, token, when_queued)) = (self.next_req_fn)() {
+            let mut state = self.state.lock().unwrap();
             let id = state.next_id;
             state.next_id.advance();
 
@@ -237,7 +222,6 @@ impl QueueMinder {
 
             Some(DeviceRequest::new(id, req, self.self_ref.clone()))
         } else {
-            state.notify_workers.set(wid);
             None
         }
     }
@@ -315,35 +299,6 @@ impl QueueMinder {
         }
     }
 
-    /// Take the bitmap of the workers which should be notified that this queue
-    /// may now have requests available.
-    ///
-    /// Bits in this map correspond to workers that either should be
-    /// [`WorkerSlot::wake`]'d or returned to this `QueueMinder` via
-    /// [`add_notifications`]. Failure to do so will result in idle workers
-    /// never being woken for future work.
-    pub(in crate::block) fn take_notifications(&self) -> Option<Bitmap> {
-        let mut state = self.state.lock().unwrap();
-        if state.paused {
-            state.notify_workers = Bitmap::ALL;
-            None
-        } else {
-            Some(state.notify_workers.take())
-        }
-    }
-
-    /// Add a set of workers to be notified when this queue may have requests
-    /// available.
-    ///
-    /// This should only be called with the remaining parts of a bitmap obtained
-    /// from an ealier [`take_notifications`]. Using other bit patterns may
-    /// result in wakeups to out-of-range worker IDs and subsequent panic.
-    pub(in crate::block) fn add_notifications(&self, worker_ids: Bitmap) {
-        let mut state = self.state.lock().unwrap();
-
-        state.notify_workers.set_all(worker_ids);
-    }
-
     /// Associate a [MetricConsumer] with this queue.
     ///
     /// It will be notified about each IO completion as they occur.
@@ -352,18 +307,6 @@ impl QueueMinder {
         consumer: Arc<dyn MetricConsumer>,
     ) {
         self.state.lock().unwrap().metric_consumer = Some(consumer);
-    }
-
-    pub(crate) fn pause(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.paused = true;
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) fn resume(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.paused = false;
-        self.notify.notify_waiters();
     }
 
     pub(crate) fn none_in_flight(&self) -> NoneInFlight<'_> {

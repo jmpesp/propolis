@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::block::{self, SyncWorkerCtx, WorkerId};
+use crate::block::attachment::WorkerCollection;
 use crate::tasks::ThreadGroup;
 use crate::vmm::{MappingExt, MemCtx};
 
@@ -17,8 +18,6 @@ use anyhow::Context;
 
 pub struct FileBackend {
     state: Arc<SharedState>,
-    block_attach: block::BackendAttachment,
-
     worker_count: NonZeroUsize,
     workers: ThreadGroup,
 }
@@ -194,7 +193,6 @@ impl FileBackend {
         } else {
             None
         };
-        let block_attach = block::BackendAttachment::new(worker_count, info);
         Ok(Arc::new(Self {
             state: SharedState::new(
                 fp,
@@ -203,16 +201,16 @@ impl FileBackend {
                 wce_state,
                 disk_info.discard_mech,
             ),
-            block_attach,
             worker_count,
             workers: ThreadGroup::new(),
         }))
     }
-    fn spawn_workers(&self) -> std::io::Result<()> {
+
+    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) -> std::io::Result<()> {
         let spawn_results = (0..self.worker_count.get())
             .map(|n| {
                 let shared_state = self.state.clone();
-                let wctx = self.block_attach.worker(n as WorkerId);
+                let wctx = workers.inactive_worker(n as WorkerId);
 
                 std::thread::Builder::new()
                     .name(format!("file worker {n}"))
@@ -231,14 +229,16 @@ impl FileBackend {
 
 #[async_trait::async_trait]
 impl block::Backend for FileBackend {
-    fn attachment(&self) -> &block::BackendAttachment {
-        &self.block_attach
+    fn info(&self) -> block::DeviceInfo {
+        self.state.info
     }
 
-    async fn start(&self) -> anyhow::Result<()> {
-        self.block_attach.start();
-        if let Err(e) = self.spawn_workers() {
-            self.block_attach.stop();
+    fn worker_count(&self) -> NonZeroUsize {
+        self.worker_count
+    }
+
+    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
+        if let Err(e) = self.spawn_workers(workers) {
             self.workers.block_until_joined();
             Err(e).context("failure while spawning workers")
         } else {
@@ -247,7 +247,6 @@ impl block::Backend for FileBackend {
     }
 
     async fn stop(&self) -> () {
-        self.block_attach.stop();
         self.workers.block_until_joined();
     }
 }

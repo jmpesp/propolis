@@ -620,6 +620,7 @@ impl StateDriver {
             log: slog::Logger,
             backends: BlockBackendMap,
         ) -> anyhow::Result<()> {
+            /*
             for (name, backend) in backends {
                 info!(log, "starting block backend {}", name);
                 let res = backend.start().await;
@@ -634,6 +635,7 @@ impl StateDriver {
                     return res;
                 }
             }
+            */
 
             Ok(())
         }

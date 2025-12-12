@@ -8,6 +8,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::block;
+use crate::block::attachment::WorkerCollection;
 use crate::tasks::TaskGroup;
 use crate::vmm::MemCtx;
 
@@ -18,9 +19,8 @@ use crate::vmm::MemCtx;
 /// stack perform.
 pub struct MemAsyncBackend {
     shared_state: Arc<SharedState>,
-    block_attach: block::BackendAttachment,
-
     workers: TaskGroup,
+    worker_count: NonZeroUsize,
 }
 struct SharedState {
     seg: MmapSeg,
@@ -28,7 +28,7 @@ struct SharedState {
 }
 impl SharedState {
     async fn processing_loop(&self, wctx: block::AsyncWorkerCtx) {
-        while let Some(dreq) = wctx.wait_for_req().await {
+        while let Some(dreq) = wctx.next_req().await {
             let req = dreq.req();
             if self.info.read_only && req.op.is_write() {
                 dreq.complete(block::Result::ReadOnly);
@@ -125,21 +125,19 @@ impl MemAsyncBackend {
             supports_discard: false,
         };
         let seg = MmapSeg::new(size as usize)?;
-        let block_attach = block::BackendAttachment::new(worker_count, info);
 
         Ok(Arc::new(Self {
             shared_state: Arc::new(SharedState { info, seg }),
-            block_attach,
-
             workers: TaskGroup::new(),
+            worker_count,
         }))
     }
 
-    fn spawn_workers(&self) {
-        let count = self.block_attach.max_workers().get();
+    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) {
+        let count = self.worker_count.get();
         self.workers.extend((0..count).map(|n| {
             let shared_state = self.shared_state.clone();
-            let wctx = self.block_attach.worker(n);
+            let wctx = workers.inactive_worker(n);
             tokio::spawn(async move {
                 let wctx =
                     wctx.activate_async().expect("worker slot is uncontended");
@@ -151,16 +149,20 @@ impl MemAsyncBackend {
 
 #[async_trait::async_trait]
 impl block::Backend for MemAsyncBackend {
-    fn attachment(&self) -> &block::BackendAttachment {
-        &self.block_attach
+    fn info(&self) -> block::DeviceInfo {
+        self.shared_state.info
     }
-    async fn start(&self) -> anyhow::Result<()> {
-        self.block_attach.start();
-        self.spawn_workers();
+
+    fn worker_count(&self) -> NonZeroUsize {
+        self.worker_count
+    }
+
+    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
+        self.spawn_workers(workers);
         Ok(())
     }
+
     async fn stop(&self) -> () {
-        self.block_attach.stop();
         self.workers.join_all().await;
     }
 }

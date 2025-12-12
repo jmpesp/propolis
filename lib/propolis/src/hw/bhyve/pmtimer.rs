@@ -46,6 +46,7 @@ impl BhyvePmTimer {
     }
 }
 
+#[async_trait::async_trait]
 impl Lifecycle for BhyvePmTimer {
     fn type_name(&self) -> &'static str {
         "lpc-bhyve-pmtimer"
@@ -63,7 +64,7 @@ impl Lifecycle for BhyvePmTimer {
         // If the machine was reset
         self.update_attachment();
     }
-    fn start(&self) -> anyhow::Result<()> {
+    async fn start(&self) -> anyhow::Result<()> {
         self.update_attachment();
         Ok(())
     }

@@ -5,9 +5,12 @@
 //! Implements an interface to virtualized block devices.
 
 use std::time::Duration;
+use std::sync::Arc;
+use std::num::NonZeroUsize;
 
 use crate::common::*;
 use crate::vmm::{MemCtx, SubMapping};
+use crate::block::attachment::WorkerCollection;
 
 mod file;
 pub use file::FileBackend;
@@ -26,10 +29,7 @@ pub use mem_async::MemAsyncBackend;
 pub mod attachment;
 pub mod minder;
 
-pub use attachment::{
-    attach, AsyncWorkerCtx, AttachError, BackendAttachment, DeviceAttachment,
-    SyncWorkerCtx,
-};
+pub use attachment::{AsyncWorkerCtx, DeviceAttachment, SyncWorkerCtx};
 pub use minder::{DeviceQueue, DeviceRequest};
 
 pub type ByteOffset = usize;
@@ -136,7 +136,7 @@ impl Result {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, PartialOrd, Ord)]
 pub struct QueueId(u8);
 impl QueueId {
     /// Arbitrary limit for per-device queues.
@@ -281,10 +281,13 @@ pub trait Device: Send + Sync + 'static {
 /// to process [Request]s posted by the guest.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + 'static {
-    /// Access to the [BackendAttachment] representing this backend.
-    fn attachment(&self) -> &BackendAttachment;
+    // XXX
+    fn info(&self) -> DeviceInfo;
 
-    /// Start attempting to process [Request]s from [Device] (if attached)
+    // XXX
+    fn worker_count(&self) -> NonZeroUsize;
+
+    /// Start attempting to process [Request]s from [Device] (if attached) XXX
     ///
     /// Spawning of any tasks required to do such request processing can be done
     /// as part of this start-up.
@@ -299,7 +302,7 @@ pub trait Backend: Send + Sync + 'static {
     /// prior to dropping the backend. This routine is, however, guaranteed to
     /// be called before the VM's vCPUs are started.
     ///
-    async fn start(&self) -> anyhow::Result<()>;
+    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()>;
 
     /// Stop attempting to process new [Request]s from [Device] (if attached)
     ///

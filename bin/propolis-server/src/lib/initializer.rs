@@ -655,11 +655,9 @@ impl MachineInitializer<'_> {
             self.block_backends.insert(backend_id.clone(), backend.clone());
             let block_dev: Arc<dyn block::Device> = match device_interface {
                 DeviceInterface::Virtio => {
-                    let vioblk = virtio::PciVirtioBlock::new(0x100);
+                    let vioblk = virtio::PciVirtioBlock::new(0x100, backend);
 
                     self.devices.insert(device_id.clone(), vioblk.clone());
-                    block::attach(&vioblk.block_attach, backend.attachment())
-                        .unwrap();
                     chipset.pci_attach(bdf, vioblk.clone());
                     vioblk
                 }
@@ -677,10 +675,9 @@ impl MachineInitializer<'_> {
                         &nvme_spec.serial_number,
                         mdts,
                         self.log.new(slog::o!("component" => component)),
+                        backend,
                     );
                     self.devices.insert(device_id.clone(), nvme.clone());
-                    block::attach(&nvme.block_attach, backend.attachment())
-                        .unwrap();
                     chipset.pci_attach(bdf, nvme.clone());
                     nvme
                 }

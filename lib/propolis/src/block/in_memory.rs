@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::block;
+use crate::block::attachment::WorkerCollection;
 use crate::common::Lifecycle;
 use crate::migrate::{
     MigrateCtx, MigrateSingle, MigrateStateError, Migrator, PayloadOffer,
@@ -19,14 +20,15 @@ use anyhow::Context;
 
 pub struct InMemoryBackend {
     shared_state: Arc<SharedState>,
-    block_attach: block::BackendAttachment,
-
     workers: ThreadGroup,
+    worker_count: NonZeroUsize,
 }
+
 struct SharedState {
     bytes: Mutex<Vec<u8>>,
     info: block::DeviceInfo,
 }
+
 impl SharedState {
     fn processing_loop(&self, wctx: block::SyncWorkerCtx) {
         while let Some(dreq) = wctx.block_for_req() {
@@ -123,20 +125,19 @@ impl InMemoryBackend {
             supports_discard: false,
         };
         let bytes = Mutex::new(bytes);
-        let block_attach = block::BackendAttachment::new(worker_count, info);
 
         Ok(Arc::new(Self {
             shared_state: Arc::new(SharedState { bytes, info }),
-            block_attach,
-
             workers: ThreadGroup::new(),
+            worker_count,
         }))
     }
-    fn spawn_workers(&self) -> Result<()> {
-        let count = self.block_attach.max_workers().get();
+
+    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) -> Result<()> {
+        let count = self.worker_count.get();
         let spawn_results = (0..count).map(|n| {
             let shared_state = self.shared_state.clone();
-            let wctx = self.block_attach.worker(n);
+            let wctx = workers.inactive_worker(n);
             std::thread::Builder::new()
                 .name(format!("in-memory worker {n}"))
                 .spawn(move || {
@@ -153,14 +154,16 @@ impl InMemoryBackend {
 
 #[async_trait::async_trait]
 impl block::Backend for InMemoryBackend {
-    fn attachment(&self) -> &block::BackendAttachment {
-        &self.block_attach
+    fn info(&self) -> block::DeviceInfo {
+        self.shared_state.info
     }
 
-    async fn start(&self) -> anyhow::Result<()> {
-        self.block_attach.start();
-        if let Err(e) = self.spawn_workers() {
-            self.block_attach.stop();
+    fn worker_count(&self) -> NonZeroUsize {
+        self.worker_count
+    }
+
+    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
+        if let Err(e) = self.spawn_workers(workers) {
             self.workers.block_until_joined();
             Err(e).context("failure while spawning workers")
         } else {
@@ -169,7 +172,6 @@ impl block::Backend for InMemoryBackend {
     }
 
     async fn stop(&self) -> () {
-        self.block_attach.stop();
         self.workers.block_until_joined();
     }
 }

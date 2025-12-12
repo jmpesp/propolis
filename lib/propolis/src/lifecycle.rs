@@ -22,6 +22,7 @@ use crate::migrate::Migrator;
 /// - [Lifecycle::reset]
 /// - [Lifecycle::halt]
 /// - [Lifecycle::migrate]
+#[async_trait::async_trait]
 pub trait Lifecycle: Send + Sync + 'static {
     /// Unique name for devices for a given type
     ///
@@ -40,7 +41,7 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// Note that this is only called the first time an instance begins running.
     /// If it reboots, the device will observe a paused -> reset -> resumed
     /// transition instead.
-    fn start(&self) -> anyhow::Result<()> {
+    async fn start(&self) -> anyhow::Result<()> {
         Ok(())
     }
 

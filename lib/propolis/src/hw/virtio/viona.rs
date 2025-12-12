@@ -513,6 +513,7 @@ impl VirtioDevice for PciVirtioViona {
         Ok(())
     }
 }
+#[async_trait::async_trait]
 impl Lifecycle for PciVirtioViona {
     fn type_name(&self) -> &'static str {
         "pci-virtio-viona"
@@ -520,7 +521,7 @@ impl Lifecycle for PciVirtioViona {
     fn reset(&self) {
         self.virtio_state.reset(self);
     }
-    fn start(&self) -> anyhow::Result<()> {
+    async fn start(&self) -> anyhow::Result<()> {
         // This device initializes into a paused state. Starting it is
         // equivalent to resuming it.
         self.resume();

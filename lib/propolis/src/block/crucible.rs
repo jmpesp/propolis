@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::block;
+use crate::block::attachment::WorkerCollection;
 use crate::tasks::TaskGroup;
 use crate::vmm::MemCtx;
 
@@ -29,7 +30,6 @@ pub use nexus_client::Client as NexusClient;
 const WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 pub struct CrucibleBackend {
-    block_attach: block::BackendAttachment,
     state: Arc<WorkerState>,
     workers: TaskGroup,
 }
@@ -45,7 +45,7 @@ impl WorkerState {
         // operations required additional space.
         let mut readbuf = Buffer::new(1, self.info.block_size as usize);
         loop {
-            let Some(dreq) = wctx.wait_for_req().await else {
+            let Some(dreq) = wctx.next_req().await else {
                 break;
             };
 
@@ -222,7 +222,6 @@ impl CrucibleBackend {
         };
 
         Ok(Arc::new(Self {
-            block_attach: block::BackendAttachment::new(WORKER_COUNT, info),
             state: Arc::new(WorkerState {
                 volume,
                 info,
@@ -274,7 +273,6 @@ impl CrucibleBackend {
         };
 
         Ok(Arc::new(CrucibleBackend {
-            block_attach: block::BackendAttachment::new(WORKER_COUNT, info),
             state: Arc::new(WorkerState {
                 volume: builder.into(),
                 info,
@@ -342,11 +340,11 @@ impl CrucibleBackend {
             .map_err(CrucibleError::into)
     }
 
-    fn spawn_workers(&self) {
-        let max_workers = self.block_attach.max_workers().get();
+    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) {
+        let max_workers = WORKER_COUNT.get();
         self.workers.extend((0..max_workers).map(|n| {
             let worker_state = self.state.clone();
-            let wctx = self.block_attach.worker(n);
+            let wctx = workers.inactive_worker(n);
 
             tokio::spawn(async move {
                 let Some(wctx) = wctx.activate_async() else {
@@ -364,17 +362,21 @@ impl CrucibleBackend {
 
 #[async_trait::async_trait]
 impl block::Backend for CrucibleBackend {
-    fn attachment(&self) -> &block::BackendAttachment {
-        &self.block_attach
+    fn info(&self) -> block::DeviceInfo {
+        self.state.info
     }
-    async fn start(&self) -> anyhow::Result<()> {
+
+    fn worker_count(&self) -> NonZeroUsize {
+        WORKER_COUNT
+    }
+
+    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
         self.state.volume.activate().await?;
-        self.block_attach.start();
-        self.spawn_workers();
+        self.spawn_workers(workers);
         Ok(())
     }
+
     async fn stop(&self) -> () {
-        self.block_attach.stop();
         self.workers.join_all().await;
     }
 }

@@ -34,7 +34,7 @@ pub struct PciVirtioBlock {
     pub block_attach: block::DeviceAttachment,
 }
 impl PciVirtioBlock {
-    pub fn new(queue_size: u16) -> Arc<Self> {
+    pub fn new(queue_size: u16, backend: Arc<dyn block::Backend>) -> Arc<Self> {
         let queues =
             VirtQueues::new([VirtQueue::new(queue_size.try_into().unwrap())])
                 .unwrap();
@@ -53,6 +53,7 @@ impl PciVirtioBlock {
 
         let block_attach = block::DeviceAttachment::new(
             NonZeroUsize::new(1).unwrap(),
+            backend,
             pci_state.acc_mem.child(Some("block backend".to_string())),
         );
         let bvq = BlockVq::new(
@@ -65,7 +66,7 @@ impl PciVirtioBlock {
     }
 
     fn block_cfg_read(&self, id: &BlockReg, ro: &mut ReadOp) {
-        let info = self.block_attach.info().unwrap_or_else(Default::default);
+        let info = self.block_attach.info();
 
         let total_bytes = info.total_size * u64::from(info.block_size);
         match id {
@@ -271,7 +272,7 @@ impl VirtioDevice for PciVirtioBlock {
         feat |= VIRTIO_BLK_F_SEG_MAX;
         feat |= VIRTIO_BLK_F_FLUSH;
 
-        let info = self.block_attach.info().unwrap_or_else(Default::default);
+        let info = self.block_attach.info();
         if info.read_only {
             feat |= VIRTIO_BLK_F_RO;
         }
@@ -303,22 +304,36 @@ impl block::Device for PciVirtioBlock {
         &self.block_attach
     }
 }
+#[async_trait::async_trait]
 impl Lifecycle for PciVirtioBlock {
     fn type_name(&self) -> &'static str {
         "pci-virtio-block"
     }
-    fn reset(&self) {
-        self.virtio_state.reset(self);
-    }
-    fn pause(&self) {
-        self.block_attach.pause()
-    }
-    fn resume(&self) {
-        self.block_attach.resume();
-    }
+
     fn paused(&self) -> BoxFuture<'static, ()> {
         Box::pin(self.block_attach.none_processing())
     }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        self.block_attach.start().await
+    }
+
+    fn pause(&self) {
+        self.block_attach.pause()
+    }
+
+    fn resume(&self) {
+        self.block_attach.resume();
+    }
+
+    fn reset(&self) {
+        self.virtio_state.reset(self);
+    }
+
+    fn halt(&self) {
+        self.block_attach.halt();
+    }
+
     fn migrate(&self) -> Migrator<'_> {
         Migrator::Multi(self)
     }

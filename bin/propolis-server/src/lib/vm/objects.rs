@@ -381,11 +381,13 @@ impl VmObjectsLocked {
             });
         });
 
+        /*
         for (id, backend) in self.block_backends.iter() {
             info!(self.log, "stopping and detaching block backend {}", id);
             backend.stop().await;
             backend.attachment().detach();
         }
+        */
     }
 
     /// Resets a VM's kernel vCPU objects to their initial states.

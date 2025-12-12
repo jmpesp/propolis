@@ -234,7 +234,7 @@ impl Inventory {
     fn destroy(&mut self) {
         // Detach all block backends from their devices
         for backend in self.block.values() {
-            backend.attachment().detach();
+            backend.stop();
         }
 
         // Drop all refs in the hopes that things can clean up after themselves
@@ -334,6 +334,7 @@ impl Instance {
                         device.resume();
                     }
                 }
+                // XXX here
                 State::Quiesce => device.pause(),
                 State::Halt => device.halt(),
                 State::Reset => device.reset(),
@@ -357,6 +358,9 @@ impl Instance {
             });
         }
 
+        /*
+        // XXX done through device now
+        // XXX need to start block backends from async or sync context?
         // Drive block backends through their necessary states too
         match state {
             State::Run if first_boot => {
@@ -376,6 +380,7 @@ impl Instance {
             }
             _ => {}
         }
+        */
     }
 
     fn state_loop(
@@ -1199,15 +1204,13 @@ fn setup_instance(
                         config::block_backend(&config, dev, log);
                     let bdf = bdf.unwrap();
 
-                    let vioblk = hw::virtio::PciVirtioBlock::new(0x100);
+                    let vioblk = hw::virtio::PciVirtioBlock::new(0x100, backend.clone());
 
                     guard
                         .inventory
                         .register_instance(&vioblk, &bdf.to_string());
                     guard.inventory.register_block(&backend, name);
 
-                    block::attach(&vioblk.block_attach, backend.attachment())
-                        .unwrap();
                     chipset_pci_attach(bdf, vioblk);
                 }
                 "pci-virtio-viona" => {
@@ -1261,13 +1264,11 @@ fn setup_instance(
                         .clone_from_slice(&dev_serial.as_bytes()[..sz]);
 
                     let nvme =
-                        hw::nvme::PciNvme::create(&serial_number, mdts, log);
+                        hw::nvme::PciNvme::create(&serial_number, mdts, log, backend.clone());
 
                     guard.inventory.register_instance(&nvme, &bdf.to_string());
                     guard.inventory.register_block(&backend, name);
 
-                    block::attach(&nvme.block_attach, backend.attachment())
-                        .unwrap();
                     chipset_pci_attach(bdf, nvme);
                 }
                 qemu::pvpanic::DEVICE_NAME => {

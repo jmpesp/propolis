@@ -269,6 +269,7 @@ impl pci::Device for I440FxHostBridge {
         &self.pci_state
     }
 }
+#[async_trait::async_trait]
 impl Lifecycle for I440FxHostBridge {
     fn type_name(&self) -> &'static str {
         "pci-i440fx-hb"
@@ -475,6 +476,7 @@ impl pci::Device for Piix3Lpc {
         }
     }
 }
+#[async_trait::async_trait]
 impl Lifecycle for Piix3Lpc {
     fn type_name(&self) -> &'static str {
         "pci-piix3-lpc"
@@ -988,6 +990,7 @@ impl pci::Device for Piix3PM {
         })
     }
 }
+#[async_trait::async_trait]
 impl Lifecycle for Piix3PM {
     fn type_name(&self) -> &'static str {
         "pci-piix3-pm"
@@ -1005,8 +1008,9 @@ impl Lifecycle for Piix3PM {
     fn resume(&self) {
         self.pmtimer.resume();
     }
-    fn start(&self) -> anyhow::Result<()> {
-        self.pmtimer.start()
+    async fn start(&self) -> anyhow::Result<()> {
+        self.pmtimer.start();
+        Ok(())
     }
     fn migrate(&self) -> Migrator<'_> {
         Migrator::Multi(self)

@@ -766,6 +766,7 @@ impl PciNvme {
         serial_number: &[u8; 20],
         mdts: Option<u8>,
         log: slog::Logger,
+        backend: Arc<dyn block::Backend>,
     ) -> Arc<Self> {
         let builder = pci::Builder::new(pci::Ident {
             vendor_id: VENDOR_OXIDE,
@@ -848,7 +849,7 @@ impl PciNvme {
         //  SHST    = 0 => no shutdown in process, normal operation
         let csts = Status(0);
 
-        let state = NvmeCtrl {
+        let mut state = NvmeCtrl {
             ctrl: CtrlState { cap, cc, csts, ..Default::default() },
             doorbell_buf: None,
             msix_hdl: None,
@@ -857,6 +858,8 @@ impl PciNvme {
             ctrl_ident,
             ns_ident,
         };
+
+        state.update_block_info(backend.info());
 
         let pci_state = builder
             // BAR0/1 are used for the main config and doorbell registers
@@ -868,25 +871,17 @@ impl PciNvme {
 
         let block_attach = block::DeviceAttachment::new(
             NonZeroUsize::new(MAX_NUM_IO_QUEUES).unwrap(),
+            backend,
             pci_state.acc_mem.child(Some("block backend".to_string())),
         );
 
-        Arc::new_cyclic(move |self_weak: &Weak<PciNvme>| {
-            let this = self_weak.clone();
-            block_attach.on_attach(Box::new(move |info| {
-                if let Some(this) = Weak::upgrade(&this) {
-                    this.state.lock().unwrap().update_block_info(info);
-                }
-            }));
-
-            PciNvme {
-                state: Mutex::new(state),
-                is_enabled: AtomicBool::new(false),
-                pci_state,
-                queues: NvmeQueues::default(),
-                block_attach,
-                log,
-            }
+        Arc::new(PciNvme {
+            state: Mutex::new(state),
+            is_enabled: AtomicBool::new(false),
+            pci_state,
+            queues: NvmeQueues::default(),
+            block_attach,
+            log,
         })
     }
 
@@ -1377,15 +1372,18 @@ impl MigrateMulti for PciNvme {
     }
 }
 
+#[async_trait::async_trait]
 impl Lifecycle for PciNvme {
     fn type_name(&self) -> &'static str {
         "pci-nvme"
     }
 
-    fn reset(&self) {
-        let mut ctrl = self.state.lock().unwrap();
-        ctrl.reset(self);
-        self.pci_state.reset(self);
+    fn paused(&self) -> BoxFuture<'static, ()> {
+        Box::pin(self.block_attach.none_processing())
+    }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        self.block_attach.start().await
     }
 
     fn pause(&self) {
@@ -1396,8 +1394,14 @@ impl Lifecycle for PciNvme {
         self.block_attach.resume();
     }
 
-    fn paused(&self) -> BoxFuture<'static, ()> {
-        Box::pin(self.block_attach.none_processing())
+    fn reset(&self) {
+        let mut ctrl = self.state.lock().unwrap();
+        ctrl.reset(self);
+        self.pci_state.reset(self);
+    }
+
+    fn halt(&self) {
+        self.block_attach.halt();
     }
 
     fn migrate(&self) -> Migrator<'_> {
