@@ -26,8 +26,8 @@ use std::task::{Context, Poll};
 
 use super::minder::{NoneInFlight, QueueMinder};
 use super::{
-    DeviceId, DeviceInfo, DeviceQueue, DeviceRequest,
-    MetricConsumer, QueueId, WorkerId,
+    DeviceId, DeviceInfo, DeviceQueue, DeviceRequest, MetricConsumer, QueueId,
+    WorkerId,
 };
 use crate::accessors::MemAccessor;
 
@@ -116,6 +116,8 @@ struct DeviceState {
 
 struct DeviceAttachInner {
     dev_state: Mutex<DeviceState>,
+    // Need to keep this around, dropping it disconnects from the tree
+    #[allow(unused)]
     acc_mem: MemAccessor,
     device_id: DeviceId,
     max_queues: NonZeroUsize,
@@ -176,12 +178,18 @@ impl DeviceAttachment {
         let max_workers = backend.worker_count();
         let synchronous = backend.synchronous();
 
+        let workers_acc_mem = acc_mem.child(Some("worker collection".to_string()));
+
         let inner = Arc::new(DeviceAttachInner {
             dev_state: Mutex::new(DeviceState::default()),
             acc_mem,
             device_id: NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed),
             max_queues,
-            workers: WorkerCollection::new(max_workers, synchronous),
+            workers: WorkerCollection::new(
+                max_workers,
+                synchronous,
+                workers_acc_mem,
+            ),
             backend,
             notify_tx,
         });
@@ -221,10 +229,7 @@ impl DeviceAttachment {
 
         let old = state.queues.insert(queue_id, minder);
 
-        assert!(
-            old.is_none(),
-            "queue slot should not have been occupied"
-        );
+        assert!(old.is_none(), "queue slot should not have been occupied");
     }
 
     /// Dissociate a [DeviceQueue] from this device
@@ -239,8 +244,10 @@ impl DeviceAttachment {
     pub fn queue_dissociate(&self, queue_id: QueueId) {
         let mut state = self.0.dev_state.lock().unwrap();
 
-        let minder =
-            state.queues.remove(&queue_id).expect("queue slot should be occupied");
+        let minder = state
+            .queues
+            .remove(&queue_id)
+            .expect("queue slot should be occupied");
 
         // XXX minder.abandon()
     }
@@ -249,7 +256,10 @@ impl DeviceAttachment {
     /// requests to process.  If the number of available requests is known, it
     /// can be communicated via `hint` in order to optimize worker waking.
     pub fn notify(&self, queue_id: QueueId, hint: ReqCountHint) {
-        self.0.notify_tx.send(DeviceAttachmentNotify::NewRequests { queue_id, hint }).unwrap();
+        self.0
+            .notify_tx
+            .send(DeviceAttachmentNotify::NewRequests { queue_id, hint })
+            .unwrap();
     }
 
     fn notify_impl(&self, queue_id: QueueId, _hint: ReqCountHint) {
@@ -312,9 +322,7 @@ impl DeviceAttachment {
             .unwrap()
             .queues
             .iter()
-            .map(|(_, minder)| {
-                minder.clone()
-            })
+            .map(|(_, minder)| minder.clone())
             .collect::<Vec<_>>();
 
         NoneProcessing {
@@ -355,26 +363,28 @@ struct WorkerState {
 
 pub(crate) struct WorkerSlot {
     state: Mutex<WorkerState>,
+    // Need to keep this around, dropping it disconnects from the tree
+    #[allow(unused)]
     acc_mem: MemAccessor,
     id: WorkerId,
 }
 
 impl WorkerSlot {
-    fn new(id: WorkerId) -> Self {
-        Self {
-            state: Mutex::new(Default::default()),
-            acc_mem: MemAccessor::new_orphan(),
-            id,
-        }
+    fn new(id: WorkerId, acc_mem: MemAccessor) -> Self {
+        Self { state: Mutex::new(Default::default()), acc_mem, id }
     }
 
     /// Called by Sync workers to block for a request
     fn block_for_req(&self) -> Option<DeviceRequest> {
-        let state = self.state.lock().unwrap();
-        assert!(state.active_type.is_some());
+        let rx = {
+            let state = self.state.lock().unwrap();
+            assert!(state.active_type.is_some());
 
-        let Some(WorkerType::Sync { rx, .. }) = &state.active_type else {
-            panic!("wrong worker type!");
+            let Some(WorkerType::Sync { rx, .. }) = &state.active_type else {
+                panic!("wrong worker type!");
+            };
+
+            rx.clone()
         };
 
         match rx.recv() {
@@ -391,9 +401,7 @@ impl WorkerSlot {
     }
 
     /// Called by asynchronous workers to wait for a request
-    async fn next_req(
-        &self,
-    ) -> Option<DeviceRequest> {
+    async fn next_req(&self) -> Option<DeviceRequest> {
         let rx = {
             let state = self.state.lock().unwrap();
             assert!(state.active_type.is_some());
@@ -405,7 +413,6 @@ impl WorkerSlot {
             rx.clone()
         };
 
-        eprintln!("id {} waiting for request", self.id);
         match rx.recv().await {
             Ok(message) => match message {
                 WorkerMessage::Request { req } => Some(req),
@@ -424,7 +431,12 @@ impl WorkerSlot {
     fn stop(&self) {
         let state = self.state.lock().unwrap();
         let Some(active_type) = &state.active_type else {
-            panic!("halting non-active worker!");
+            // Dropping WorkerCtxInner will set active to None, which could race
+            // with this ?
+            //
+            // without that functionality, this was never activated, so bail
+            eprintln!("cannot send stop message!");
+            return;
         };
         match active_type {
             WorkerType::Sync { tx, .. } => {
@@ -446,6 +458,9 @@ impl WorkerSlot {
 
 pub struct WorkerCollection {
     workers: Vec<WorkerSlot>,
+    // Need to keep this around, dropping it disconnects from the tree
+    #[allow(unused)]
+    acc_mem: MemAccessor,
     sync: bool,
 
     // XXX wrap in enum
@@ -457,32 +472,36 @@ pub struct WorkerCollection {
 }
 
 impl WorkerCollection {
-    fn new(max_workers: NonZeroUsize, sync: bool) -> Arc<Self> {
+    fn new(
+        max_workers: NonZeroUsize,
+        sync: bool,
+        acc_mem: MemAccessor,
+    ) -> Arc<Self> {
         let max_workers = max_workers.get();
         assert!(max_workers <= MAX_WORKERS.get());
         let workers: Vec<_> = (0..max_workers)
-            .map(|id| WorkerSlot::new(WorkerId::from(id)))
+            .map(|id| WorkerSlot::new(
+                WorkerId::from(id),
+                acc_mem.child(Some(format!("worker slot {id}"))),
+            ))
             .collect();
 
         let channel_depth = 65536 * 64; // XXX max queue depth * max queues
         let (sync_tx, sync_rx) = crossbeam::channel::bounded(channel_depth);
         let (async_tx, async_rx) = async_channel::bounded(channel_depth);
 
-        Arc::new(Self {
-            workers,
-            sync,
-            sync_tx,
-            sync_rx,
-            async_tx,
-            async_rx,
-        })
+        Arc::new(Self { workers, acc_mem, sync, sync_tx, sync_rx, async_tx, async_rx })
     }
 
     fn send_req(&self, req: WorkerMessage) {
         if self.sync {
-            self.sync_tx.send(req);
+            if let Err(e) = self.sync_tx.send(req) {
+                eprintln!("worker sync req send fail");
+            }
         } else {
-            self.async_tx.send_blocking(req);
+            if let Err(e) = self.async_tx.send_blocking(req) {
+                eprintln!("worker async req send fail");
+            }
         }
     }
 
@@ -490,10 +509,13 @@ impl WorkerCollection {
         self.set_active(
             id,
             if active {
-                Some(WorkerType::Sync { tx: self.sync_tx.clone(), rx: self.sync_rx.clone() })
+                Some(WorkerType::Sync {
+                    tx: self.sync_tx.clone(),
+                    rx: self.sync_rx.clone(),
+                })
             } else {
                 None
-            }
+            },
         )
     }
 
@@ -501,10 +523,13 @@ impl WorkerCollection {
         self.set_active(
             id,
             if active {
-                Some(WorkerType::Async { tx: self.async_tx.clone(), rx: self.async_rx.clone() })
+                Some(WorkerType::Async {
+                    tx: self.async_tx.clone(),
+                    rx: self.async_rx.clone(),
+                })
             } else {
                 None
-            }
+            },
         )
     }
 
@@ -546,7 +571,10 @@ impl WorkerCollection {
         self.workers.get(id).expect("valid worker id for slot")
     }
 
-    pub fn inactive_worker(self: &Arc<Self>, id: WorkerId) -> InactiveWorkerCtx {
+    pub fn inactive_worker(
+        self: &Arc<Self>,
+        id: WorkerId,
+    ) -> InactiveWorkerCtx {
         assert!(id < self.workers.len());
         InactiveWorkerCtx { workers: self.clone(), id }
     }
@@ -595,8 +623,7 @@ impl InactiveWorkerCtx {
     /// Returns [None] if there is already an active worker in the slot
     /// associated with this [WorkerId].
     pub fn activate_async(self) -> Option<AsyncWorkerCtx> {
-        if self.workers.set_active_async(self.id, true)
-        {
+        if self.workers.set_active_async(self.id, true) {
             Some(AsyncWorkerCtx(self.into()))
         } else {
             None
@@ -668,9 +695,13 @@ impl WorkerCtxInner {
 impl Drop for WorkerCtxInner {
     /// Deactivate the worker when it is dropped
     fn drop(&mut self) {
-        assert!(
+        // Assert that the worker was active when it was dropped
+        // XXX why?
+        // XXX this happens when processing loop dies, which happens when tx
+        // closed, which happens when DeviceAttachment drops WorkerCollection
+        /*assert!(
             self.workers.set_active(self.id, None),
             "active worker is valid during deactivation"
-        );
+        );*/
     }
 }

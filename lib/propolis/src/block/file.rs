@@ -58,9 +58,7 @@ impl SharedState {
     }
 
     fn processing_loop(&self, wctx: SyncWorkerCtx) {
-        eprintln!("wctx {} processing_loop waiting for req", wctx.id());
         while let Some(dreq) = wctx.block_for_req() {
-            eprintln!("wctx {} processing_loop got req", wctx.id());
             let req = dreq.req();
             if self.info.read_only && req.op.is_write() {
                 dreq.complete(block::Result::ReadOnly);
@@ -71,15 +69,11 @@ impl SharedState {
                 continue;
             }
 
-            eprintln!("wctx {} processing_loop got req 1", wctx.id());
             let Some(mem) = wctx.acc_mem().access() else {
                 dreq.complete(block::Result::Failure);
                 continue;
             };
-            eprintln!("wctx {} processing_loop got req 2", wctx.id());
-            let res = self.process_request(&req, &mem);
-            eprintln!("wctx {} req {res:?}", wctx.id());
-            let res = match res {
+            let res = match self.process_request(&req, &mem) {
                 Ok(_) => block::Result::Success,
                 Err(_) => block::Result::Failure,
             };
