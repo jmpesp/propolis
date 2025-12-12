@@ -30,6 +30,7 @@ mod requests;
 
 use bits::*;
 use queue::{CompQueue, QueueId, SubQueue};
+use requests::NvmeBlockQueue;
 
 #[usdt::provider(provider = "propolis")]
 mod probes {
@@ -754,7 +755,7 @@ pub struct PciNvme {
     pci_state: pci::DeviceState,
 
     /// Block attachment point
-    pub block_attach: block::DeviceAttachment,
+    pub block_attach: block::DeviceAttachment<NvmeBlockQueue>,
 
     /// Logger resource
     log: slog::Logger,
@@ -766,7 +767,7 @@ impl PciNvme {
         serial_number: &[u8; 20],
         mdts: Option<u8>,
         log: slog::Logger,
-        backend: Arc<dyn block::Backend>,
+        backend: Arc<dyn block::Backend<NvmeBlockQueue>>,
     ) -> Arc<Self> {
         let builder = pci::Builder::new(pci::Ident {
             vendor_id: VENDOR_OXIDE,

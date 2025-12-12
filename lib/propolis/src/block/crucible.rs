@@ -39,39 +39,41 @@ struct WorkerState {
     skip_flush: bool,
 }
 impl WorkerState {
-    async fn process_loop(&self, wctx: block::AsyncWorkerCtx) {
+    async fn process_loop<DQ: block::DeviceQueue>(&self, wctx: block::AsyncWorkerCtx<DQ>) {
         // Start with a read buffer of a single block
         // It will be resized larger (and remain so) if subsequent read
         // operations required additional space.
         let mut readbuf = Buffer::new(1, self.info.block_size as usize);
         loop {
-            let Some(dreq) = wctx.next_req().await else {
+            let Some(dreqs) = wctx.next_req().await else {
                 break;
             };
 
-            let Some(memctx) = wctx.acc_mem().access() else {
-                dreq.complete(block::Result::Failure);
-                continue;
-            };
+            for dreq in dreqs {
+                let Some(memctx) = wctx.acc_mem().access() else {
+                    dreq.complete(block::Result::Failure);
+                    continue;
+                };
 
-            let res = match self
-                .process_request(
-                    self.volume.deref(),
-                    dreq.req(),
-                    &mut readbuf,
-                    &memctx,
-                )
-                .await
-            {
-                Ok(_) => block::Result::Success,
-                Err(e) => {
-                    let mapped = block::Result::from(e);
-                    assert!(mapped.is_err());
-                    mapped
-                }
-            };
+                let res = match self
+                    .process_request(
+                        self.volume.deref(),
+                        dreq.req(),
+                        &mut readbuf,
+                        &memctx,
+                    )
+                    .await
+                {
+                    Ok(_) => block::Result::Success,
+                    Err(e) => {
+                        let mapped = block::Result::from(e);
+                        assert!(mapped.is_err());
+                        mapped
+                    }
+                };
 
-            dreq.complete(res);
+                dreq.complete(res);
+            }
         }
     }
 
@@ -340,7 +342,7 @@ impl CrucibleBackend {
             .map_err(CrucibleError::into)
     }
 
-    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) {
+    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) {
         let max_workers = WORKER_COUNT.get();
         self.workers.extend((0..max_workers).map(|n| {
             let worker_state = self.state.clone();
@@ -361,7 +363,7 @@ impl CrucibleBackend {
 }
 
 #[async_trait::async_trait]
-impl block::Backend for CrucibleBackend {
+impl<DQ: block::DeviceQueue> block::Backend<DQ> for CrucibleBackend {
     fn info(&self) -> block::DeviceInfo {
         self.state.info
     }
@@ -374,7 +376,7 @@ impl block::Backend for CrucibleBackend {
         false
     }
 
-    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
+    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
         self.state.volume.activate().await?;
         self.spawn_workers(workers);
         Ok(())

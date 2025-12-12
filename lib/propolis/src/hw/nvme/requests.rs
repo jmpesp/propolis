@@ -31,13 +31,13 @@ mod probes {
     }
 }
 
-impl block::Device for PciNvme {
-    fn attachment(&self) -> &block::DeviceAttachment {
+impl block::Device<NvmeBlockQueue> for PciNvme {
+    fn attachment(&self) -> &block::DeviceAttachment<NvmeBlockQueue> {
         &self.block_attach
     }
 }
 
-pub(super) struct NvmeBlockQueue {
+pub struct NvmeBlockQueue {
     sq: Arc<SubQueue>,
     acc_mem: MemAccessor,
 }
@@ -51,11 +51,14 @@ impl block::DeviceQueue for NvmeBlockQueue {
 
     /// Pop an available I/O request off of the Submission Queue for hand-off to
     /// the underlying block backend
-    fn next_req(&self) -> Option<(Request, Self::Token, Option<Instant>)> {
+    fn next_reqs(&self) -> Vec<(Request, Self::Token, Option<Instant>)> {
         let sq = &self.sq;
-        let mem = self.acc_mem.access()?;
+        let Some(mem) = self.acc_mem.access() else {
+            return vec![];
+        };
         let params = self.sq.params();
 
+        let mut reqs = Vec::with_capacity(65536);
         while let Some((sub, permit, idx)) = sq.pop() {
             let qid = sq.id();
             probes::nvme_raw_cmd!(|| {
@@ -88,7 +91,7 @@ impl block::DeviceQueue for NvmeBlockQueue {
                     let bufs = cmd.data(size, &mem).collect();
                     let req =
                         Request::new_write(off as usize, size as usize, bufs);
-                    return Some((req, permit, None));
+                    reqs.push((req, permit, None));
                 }
                 Ok(NvmCmd::Read(cmd)) => {
                     let off = params.lba_data_size * cmd.slba;
@@ -107,12 +110,12 @@ impl block::DeviceQueue for NvmeBlockQueue {
                     let bufs = cmd.data(size, &mem).collect();
                     let req =
                         Request::new_read(off as usize, size as usize, bufs);
-                    return Some((req, permit, None));
+                    reqs.push((req, permit, None));
                 }
                 Ok(NvmCmd::Flush) => {
                     probes::nvme_flush_enqueue!(|| (qid, idx, cid));
                     let req = Request::new_flush();
-                    return Some((req, permit, None));
+                    reqs.push((req, permit, None));
                 }
                 Ok(NvmCmd::Unknown(_)) | Err(_) => {
                     // For any other unrecognized or malformed command,
@@ -122,7 +125,7 @@ impl block::DeviceQueue for NvmeBlockQueue {
                 }
             }
         }
-        None
+        reqs
     }
 
     /// Place the operation result (success or failure) onto the corresponding

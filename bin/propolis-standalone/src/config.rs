@@ -162,11 +162,11 @@ fn opt_deser<'de, T: Deserialize<'de>>(
 const DEFAULT_WORKER_COUNT: usize = 8;
 const MAX_FILE_WORKERS: usize = 32;
 
-pub fn block_backend(
+pub fn block_backend<DQ: block::DeviceQueue>(
     config: &Config,
     dev: &Device,
     log: &slog::Logger,
-) -> (Arc<dyn block::Backend>, String) {
+) -> (Arc<dyn block::Backend<DQ>>, String) {
     let backend_name = dev.options.get("block_dev").unwrap().as_str().unwrap();
     let Some(be) = config.block_devs.get(backend_name) else {
         panic!("No configured block device named \"{backend_name}\"");
@@ -388,11 +388,11 @@ fn create_crucible_backend(
 }
 
 #[cfg(feature = "crucible")]
-fn create_crucible_mem_backend(
+fn create_crucible_mem_backend<DQ: block::DeviceQueue>(
     be: &BlockDevice,
     opts: block::BackendOpts,
     log: &slog::Logger,
-) -> Arc<dyn block::Backend> {
+) -> Arc<dyn block::Backend<DQ>> {
     #[derive(Deserialize)]
     struct CrucibleMemConfig {
         size: u64,
@@ -407,11 +407,11 @@ fn create_crucible_mem_backend(
 }
 
 #[cfg(not(feature = "crucible"))]
-fn create_crucible_backend(
+fn create_crucible_backend<DQ: block::DeviceQueue>(
     _be: &BlockDevice,
     _opts: block::BackendOpts,
     _log: &slog::Logger,
-) -> Arc<dyn block::Backend> {
+) -> Arc<dyn block::Backend<DQ>> {
     panic!(
         "Rebuild propolis-standalone with 'crucible' feature enabled in \
            order to use the crucible block backend"
@@ -419,11 +419,11 @@ fn create_crucible_backend(
 }
 
 #[cfg(not(feature = "crucible"))]
-fn create_crucible_mem_backend(
+fn create_crucible_mem_backend<DQ: block::DeviceQueue>(
     _be: &BlockDevice,
     _opts: block::BackendOpts,
     _log: &slog::Logger,
-) -> Arc<dyn block::Backend> {
+) -> Arc<dyn block::Backend<DQ>> {
     panic!(
         "Rebuild propolis-standalone with 'crucible' feature enabled in \
            order to use the crucible-mem block backend"

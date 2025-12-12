@@ -259,15 +259,15 @@ pub struct BackendOpts {
 
 /// Top-level trait for block devices (frontends) to translate guest block IO
 /// requests into [Request]s for the attached [Backend]
-pub trait Device: Send + Sync + 'static {
+pub trait Device<DQ: DeviceQueue>: Send + Sync + 'static {
     /// Access to the [DeviceAttachment] representing this device.
-    fn attachment(&self) -> &DeviceAttachment;
+    fn attachment(&self) -> &DeviceAttachment<DQ>;
 }
 
 /// Top-level trait for block backends which will attach to [Device]s in order
 /// to process [Request]s posted by the guest.
 #[async_trait::async_trait]
-pub trait Backend: Send + Sync + 'static {
+pub trait Backend<DQ: DeviceQueue>: Send + Sync + 'static {
     // XXX
     fn info(&self) -> DeviceInfo;
 
@@ -292,7 +292,7 @@ pub trait Backend: Send + Sync + 'static {
     /// prior to dropping the backend. This routine is, however, guaranteed to
     /// be called before the VM's vCPUs are started.
     ///
-    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()>;
+    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()>;
 
     /// Stop attempting to process new [Request]s from [Device] (if attached)
     ///

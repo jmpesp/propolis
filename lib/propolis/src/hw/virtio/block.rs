@@ -31,10 +31,13 @@ const MAX_DISCARD_SECTORS: u32 = ((1024 * 1024) / SECTOR_SZ) as u32;
 pub struct PciVirtioBlock {
     virtio_state: PciVirtioState,
     pci_state: pci::DeviceState,
-    pub block_attach: block::DeviceAttachment,
+    pub block_attach: block::DeviceAttachment<BlockVq>,
 }
 impl PciVirtioBlock {
-    pub fn new(queue_size: u16, backend: Arc<dyn block::Backend>) -> Arc<Self> {
+    pub fn new(
+        queue_size: u16,
+        backend: Arc<dyn block::Backend<BlockVq>>,
+    ) -> Arc<Self> {
         let queues =
             VirtQueues::new([VirtQueue::new(queue_size.try_into().unwrap())])
                 .unwrap();
@@ -110,14 +113,14 @@ impl PciVirtioBlock {
     }
 }
 
-struct CompletionToken {
+pub struct CompletionToken {
     /// ID of original request.
     rid: u16,
     /// VirtIO chain in which we indicate the result.
     chain: Chain,
 }
 
-struct BlockVq(Arc<VirtQueue>, MemAccessor);
+pub struct BlockVq(Arc<VirtQueue>, MemAccessor);
 impl BlockVq {
     fn new(vq: Arc<VirtQueue>, acc_mem: MemAccessor) -> Arc<Self> {
         Arc::new(Self(vq, acc_mem))
@@ -126,102 +129,112 @@ impl BlockVq {
 impl block::DeviceQueue for BlockVq {
     type Token = CompletionToken;
 
-    fn next_req(
+    fn next_reqs(
         &self,
-    ) -> Option<(block::Request, Self::Token, Option<Instant>)> {
+    ) -> Vec<(block::Request, Self::Token, Option<Instant>)> {
         let vq = &self.0;
-        let mem = self.1.access()?;
-
-        let mut chain = Chain::with_capacity(4);
-        // Pop a request off the queue if there's one available.
-        // For debugging purposes, we'll also use the returned index
-        // as a psuedo-id for the request to associate it with its
-        // subsequent completion
-        let (rid, _clen) = vq.pop_avail(&mut chain, &mem)?;
-
-        let mut breq = VbReq::default();
-        if !chain.read(&mut breq, &mem) {
-            todo!("error handling");
-        }
-        let off = breq.sector as usize * SECTOR_SZ;
-        let req = match breq.rtype {
-            VIRTIO_BLK_T_IN => {
-                // should be (blocksize * 512) + 1 remaining writable byte for status
-                // TODO: actually enforce block size
-                let blocks = (chain.remain_write_bytes() - 1) / SECTOR_SZ;
-                let sz = blocks * SECTOR_SZ;
-
-                if let Some(regions) = chain.writable_bufs(sz) {
-                    probes::vioblk_read_enqueue!(|| (
-                        rid, off as u64, sz as u64
-                    ));
-                    Ok((
-                        block::Request::new_read(off, sz, regions),
-                        CompletionToken { rid, chain },
-                        None,
-                    ))
-                } else {
-                    Err(chain)
-                }
-            }
-            VIRTIO_BLK_T_OUT => {
-                // should be (blocksize * 512) remaining read bytes
-                let blocks = chain.remain_read_bytes() / SECTOR_SZ;
-                let sz = blocks * SECTOR_SZ;
-
-                if let Some(regions) = chain.readable_bufs(sz) {
-                    probes::vioblk_write_enqueue!(|| (
-                        rid, off as u64, sz as u64
-                    ));
-                    Ok((
-                        block::Request::new_write(off, sz, regions),
-                        CompletionToken { rid, chain },
-                        None,
-                    ))
-                } else {
-                    Err(chain)
-                }
-            }
-            VIRTIO_BLK_T_FLUSH => {
-                probes::vioblk_flush_enqueue!(|| rid);
-                Ok((
-                    block::Request::new_flush(),
-                    CompletionToken { rid, chain },
-                    None,
-                ))
-            }
-            VIRTIO_BLK_T_DISCARD => {
-                let mut detail = DiscardWriteZeroes::default();
-                if !chain.read(&mut detail, &mem) {
-                    Err(chain)
-                } else {
-                    let off = detail.sector as usize * SECTOR_SZ;
-                    let sz = detail.num_sectors as usize * SECTOR_SZ;
-                    probes::vioblk_discard_enqueue!(|| (
-                        rid, off as u64, sz as u64,
-                    ));
-                    Ok((
-                        block::Request::new_discard(off, sz),
-                        CompletionToken { rid, chain },
-                        None,
-                    ))
-                }
-            }
-            _ => Err(chain),
+        let Some(mem) = self.1.access() else {
+            return vec![];
         };
-        match req {
-            Err(mut chain) => {
-                // try to set the status byte to failed
-                let remain = chain.remain_write_bytes();
-                if remain >= 1 {
-                    chain.write_skip(remain - 1);
-                    chain.write(&VIRTIO_BLK_S_UNSUPP, &mem);
-                }
-                vq.push_used(&mut chain, &mem);
-                None
+
+        let mut reqs = Vec::with_capacity(65536);
+        loop {
+            let mut chain = Chain::with_capacity(4);
+            // Pop a request off the queue if there's one available.
+            // For debugging purposes, we'll also use the returned index
+            // as a psuedo-id for the request to associate it with its
+            // subsequent completion
+            let Some((rid, _clen)) = vq.pop_avail(&mut chain, &mem) else {
+                break;
+            };
+
+            let mut breq = VbReq::default();
+            if !chain.read(&mut breq, &mem) {
+                todo!("error handling");
             }
-            Ok(r) => Some(r),
+            let off = breq.sector as usize * SECTOR_SZ;
+            let req = match breq.rtype {
+                VIRTIO_BLK_T_IN => {
+                    // should be (blocksize * 512) + 1 remaining writable byte for status
+                    // TODO: actually enforce block size
+                    let blocks = (chain.remain_write_bytes() - 1) / SECTOR_SZ;
+                    let sz = blocks * SECTOR_SZ;
+
+                    if let Some(regions) = chain.writable_bufs(sz) {
+                        probes::vioblk_read_enqueue!(|| (
+                            rid, off as u64, sz as u64
+                        ));
+                        Ok((
+                            block::Request::new_read(off, sz, regions),
+                            CompletionToken { rid, chain },
+                            None,
+                        ))
+                    } else {
+                        Err(chain)
+                    }
+                }
+                VIRTIO_BLK_T_OUT => {
+                    // should be (blocksize * 512) remaining read bytes
+                    let blocks = chain.remain_read_bytes() / SECTOR_SZ;
+                    let sz = blocks * SECTOR_SZ;
+
+                    if let Some(regions) = chain.readable_bufs(sz) {
+                        probes::vioblk_write_enqueue!(|| (
+                            rid, off as u64, sz as u64
+                        ));
+                        Ok((
+                            block::Request::new_write(off, sz, regions),
+                            CompletionToken { rid, chain },
+                            None,
+                        ))
+                    } else {
+                        Err(chain)
+                    }
+                }
+                VIRTIO_BLK_T_FLUSH => {
+                    probes::vioblk_flush_enqueue!(|| rid);
+                    Ok((
+                        block::Request::new_flush(),
+                        CompletionToken { rid, chain },
+                        None,
+                    ))
+                }
+                VIRTIO_BLK_T_DISCARD => {
+                    let mut detail = DiscardWriteZeroes::default();
+                    if !chain.read(&mut detail, &mem) {
+                        Err(chain)
+                    } else {
+                        let off = detail.sector as usize * SECTOR_SZ;
+                        let sz = detail.num_sectors as usize * SECTOR_SZ;
+                        probes::vioblk_discard_enqueue!(|| (
+                            rid, off as u64, sz as u64,
+                        ));
+                        Ok((
+                            block::Request::new_discard(off, sz),
+                            CompletionToken { rid, chain },
+                            None,
+                        ))
+                    }
+                }
+                _ => Err(chain),
+            };
+            match req {
+                Err(mut chain) => {
+                    // try to set the status byte to failed
+                    let remain = chain.remain_write_bytes();
+                    if remain >= 1 {
+                        chain.write_skip(remain - 1);
+                        chain.write(&VIRTIO_BLK_S_UNSUPP, &mem);
+                    }
+                    vq.push_used(&mut chain, &mem);
+                }
+
+                Ok(r) => {
+                    reqs.push(r);
+                }
+            }
         }
+        reqs
     }
 
     fn complete(
@@ -299,8 +312,8 @@ impl PciVirtio for PciVirtioBlock {
         &self.pci_state
     }
 }
-impl block::Device for PciVirtioBlock {
-    fn attachment(&self) -> &block::DeviceAttachment {
+impl block::Device<BlockVq> for PciVirtioBlock {
+    fn attachment(&self) -> &block::DeviceAttachment<BlockVq> {
         &self.block_attach
     }
 }

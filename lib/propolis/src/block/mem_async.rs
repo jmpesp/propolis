@@ -27,28 +27,33 @@ struct SharedState {
     info: block::DeviceInfo,
 }
 impl SharedState {
-    async fn processing_loop(&self, wctx: block::AsyncWorkerCtx) {
-        eprintln!("wctx {} processing loop, waiting for request", wctx.id());
-        while let Some(dreq) = wctx.next_req().await {
-            let req = dreq.req();
-            if self.info.read_only && req.op.is_write() {
-                dreq.complete(block::Result::ReadOnly);
+    async fn processing_loop<DQ: block::DeviceQueue>(&self, wctx: block::AsyncWorkerCtx<DQ>) {
+        while let Some(dreqs) = wctx.next_req().await {
+            for dreq in dreqs {
+                dreq.complete(block::Result::Success);
                 continue;
-            }
-            if req.op.is_discard() {
-                dreq.complete(block::Result::Unsupported);
-                continue;
-            }
 
-            let res = match wctx
-                .acc_mem()
-                .access()
-                .and_then(|mem| self.process_request(&req, &mem).ok())
-            {
-                Some(_) => block::Result::Success,
-                None => block::Result::Failure,
-            };
-            dreq.complete(res);
+                let req = dreq.req();
+                if self.info.read_only && req.op.is_write() {
+                    dreq.complete(block::Result::ReadOnly);
+                    continue;
+                }
+                if req.op.is_discard() {
+                    dreq.complete(block::Result::Unsupported);
+                    continue;
+                }
+
+                let res = match wctx
+                    .acc_mem()
+                    .access()
+                    .and_then(|mem| self.process_request(&req, &mem).ok())
+                {
+                    Some(_) => block::Result::Success,
+                    None => block::Result::Failure,
+                };
+
+                dreq.complete(res);
+            }
         }
     }
 
@@ -134,7 +139,7 @@ impl MemAsyncBackend {
         }))
     }
 
-    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) {
+    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) {
         let count = self.worker_count.get();
         self.workers.extend((0..count).map(|n| {
             let shared_state = self.shared_state.clone();
@@ -149,7 +154,7 @@ impl MemAsyncBackend {
 }
 
 #[async_trait::async_trait]
-impl block::Backend for MemAsyncBackend {
+impl<DQ: block::DeviceQueue> block::Backend<DQ> for MemAsyncBackend {
     fn info(&self) -> block::DeviceInfo {
         self.shared_state.info
     }
@@ -162,7 +167,7 @@ impl block::Backend for MemAsyncBackend {
         false
     }
 
-    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
+    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
         self.spawn_workers(workers);
         Ok(())
     }

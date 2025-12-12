@@ -205,7 +205,6 @@ impl State {
 #[derive(Default)]
 struct Inventory {
     devs: BTreeMap<String, Arc<dyn propolis::common::Lifecycle>>,
-    block: BTreeMap<String, Arc<dyn propolis::block::Backend>>,
 }
 impl Inventory {
     fn register<D: propolis::common::Lifecycle>(&mut self, dev: &Arc<D>) {
@@ -224,17 +223,9 @@ impl Inventory {
             dev.clone() as Arc<dyn propolis::common::Lifecycle>,
         );
     }
-    fn register_block(
-        &mut self,
-        be: &Arc<dyn propolis::block::Backend>,
-        name: String,
-    ) {
-        self.block.insert(name, be.clone());
-    }
     fn destroy(&mut self) {
         // Drop all refs in the hopes that things can clean up after themselves
         self.devs.clear();
-        self.block.clear();
     }
 }
 
@@ -1211,7 +1202,6 @@ fn setup_instance(
                     guard
                         .inventory
                         .register_instance(&vioblk, &bdf.to_string());
-                    guard.inventory.register_block(&backend, name);
 
                     chipset_pci_attach(bdf, vioblk);
                 }
@@ -1269,7 +1259,6 @@ fn setup_instance(
                         hw::nvme::PciNvme::create(&serial_number, mdts, log, backend.clone());
 
                     guard.inventory.register_instance(&nvme, &bdf.to_string());
-                    guard.inventory.register_block(&backend, name);
 
                     chipset_pci_attach(bdf, nvme);
                 }

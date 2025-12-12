@@ -33,7 +33,7 @@ pub trait DeviceQueue: Send + Sync + 'static {
     /// Get the next [Request] (if any) from this queue.  Supporting data
     /// included with the request consists of the necessary [Self::Token] as
     /// well an optional [queued-time](Instant).
-    fn next_req(&self) -> Option<(Request, Self::Token, Option<Instant>)>;
+    fn next_reqs(&self) -> Vec<(Request, Self::Token, Option<Instant>)>;
 
     /// Emit a completion for a processed request, identified by its
     /// [token](Self::Token).
@@ -50,14 +50,14 @@ pub trait DeviceQueue: Send + Sync + 'static {
 ///
 /// A panic will occur a `DeviceRequest` instance is dropped without calling
 /// [complete()](DeviceRequest::complete()).
-pub struct DeviceRequest {
+pub struct DeviceRequest<DQ: DeviceQueue> {
     req: Request,
     id: ReqId,
-    source: Weak<QueueMinder>,
+    source: Weak<QueueMinder<DQ>>,
     _nodrop: NoDropDevReq,
 }
-impl DeviceRequest {
-    fn new(id: ReqId, req: Request, source: Weak<QueueMinder>) -> Self {
+impl<DQ: DeviceQueue> DeviceRequest<DQ> {
+    fn new(id: ReqId, req: Request, source: Weak<QueueMinder<DQ>>) -> Self {
         Self { req, id, source, _nodrop: NoDropDevReq }
     }
 
@@ -86,33 +86,16 @@ impl Drop for NoDropDevReq {
     }
 }
 
-/// Closure to permit [QueueMinder] to type-erase the calling of
-/// [DeviceQueue::next_req()].
-type NextReqFn = Box<
-    dyn Fn() -> Option<(
-            block::Request,
-            Box<dyn Any + Send + Sync>,
-            Option<Instant>,
-        )> + Send
-        + Sync,
->;
-
-/// Closure to permit [QueueMinder] to type-erase the calling of
-/// [DeviceQueue::complete()].
-type CompleteReqFn = Box<
-    dyn Fn(Operation, block::Result, Box<dyn Any + Send + Sync>) + Send + Sync,
->;
-
-struct QmEntry {
-    token: Box<dyn Any + Send + Sync>,
+struct QmEntry<T: Send + Sync + 'static> {
+    token: T,
     op: Operation,
     when_queued: Instant,
     when_started: Instant,
 }
 
-struct QmInner {
+struct QmInner<T: Send + Sync + 'static> {
     next_id: ReqId,
-    in_flight: BTreeMap<ReqId, QmEntry>,
+    in_flight: BTreeMap<ReqId, QmEntry<T>>,
     metric_consumer: Option<Arc<dyn MetricConsumer>>,
     /// Number of [Request] completions which are currently being processed by
     /// the device.  This is tracked only for requests which are the last entry
@@ -121,7 +104,7 @@ struct QmInner {
     processing_last: usize,
 }
 
-impl Default for QmInner {
+impl<T: Send + Sync + 'static> Default for QmInner<T> {
     fn default() -> Self {
         Self {
             next_id: ReqId::START,
@@ -132,58 +115,40 @@ impl Default for QmInner {
     }
 }
 
-pub(super) struct QueueMinder {
+pub(super) struct QueueMinder<DQ: DeviceQueue> {
+    queue: Arc<DQ>,
     pub queue_id: QueueId,
     pub device_id: DeviceId,
-    state: Mutex<QmInner>,
+    state: Mutex<QmInner<DQ::Token>>,
     self_ref: Weak<Self>,
     notify: Notify,
-    /// Type-erased wrapper function for [DeviceQueue::next_req()]
-    next_req_fn: NextReqFn,
-    /// Type-erased wrapper function for [DeviceQueue::complete()]
-    complete_req_fn: CompleteReqFn,
 }
 
-impl QueueMinder {
-    pub fn new<DQ: DeviceQueue>(
+impl<DQ: DeviceQueue> QueueMinder<DQ> {
+    pub fn new(
         queue: Arc<DQ>,
         device_id: DeviceId,
         queue_id: QueueId,
     ) -> Arc<Self> { // XXX needs to be Arc for NoneProcessing?
-        let next_req_queue = queue.clone();
-        let next_req_fn: NextReqFn = Box::new(move || {
-            let (req, token, when_queued) = next_req_queue.next_req()?;
-            Some((
-                req,
-                Box::new(token) as Box<dyn Any + Send + Sync>,
-                when_queued,
-            ))
-        });
-
-        let complete_req_fn: CompleteReqFn =
-            Box::new(move |op, result, token| {
-                let token = token
-                    .downcast::<DQ::Token>()
-                    .expect("token type unchanged");
-                let token = *token;
-                queue.complete(op, result, token);
-            });
-
         Arc::new_cyclic(|self_ref| Self {
+            queue,
             queue_id,
             device_id,
             state: Mutex::new(QmInner::default()),
             self_ref: self_ref.clone(),
             notify: Notify::new(),
-            next_req_fn,
-            complete_req_fn,
+            //next_req_fn,
+            //complete_req_fn,
         })
     }
 
     /// Attempt to fetch the next IO request from this queue for a worker.
-    pub fn next_req(&self) -> Option<DeviceRequest> {
-        if let Some((req, token, when_queued)) = (self.next_req_fn)() {
-            let mut state = self.state.lock().unwrap();
+    pub fn next_reqs(&self) -> Vec<DeviceRequest<DQ>> {
+        let mut dreqs = Vec::with_capacity(65536);
+        let reqs = self.queue.next_reqs();
+
+        let mut state = self.state.lock().unwrap();
+        for (req, token, when_queued) in reqs {
             let id = state.next_id;
             state.next_id.advance();
 
@@ -220,10 +185,9 @@ impl QueueMinder {
             );
             assert!(old.is_none(), "request IDs should not overlap");
 
-            Some(DeviceRequest::new(id, req, self.self_ref.clone()))
-        } else {
-            None
+            dreqs.push(DeviceRequest::new(id, req, self.self_ref.clone()))
         }
+        dreqs
     }
 
     /// Process a completion for an in-flight IO request on this queue.
@@ -269,7 +233,7 @@ impl QueueMinder {
             }
         }
 
-        (self.complete_req_fn)(ent.op, result, ent.token);
+        self.queue.complete(ent.op, result, ent.token);
 
         probes::block_completion_sent!(|| {
             (devqid, id, when_done.elapsed().as_nanos() as u64)
@@ -309,7 +273,7 @@ impl QueueMinder {
         self.state.lock().unwrap().metric_consumer = Some(consumer);
     }
 
-    pub(crate) fn none_in_flight(&self) -> NoneInFlight<'_> {
+    pub(crate) fn none_in_flight(&self) -> NoneInFlight<'_, DQ> {
         NoneInFlight { minder: self, wait: self.notify.notified() }
     }
 }
@@ -317,13 +281,13 @@ impl QueueMinder {
 pin_project! {
     /// A [Future] which resolves to [Ready](Poll::Ready) when there are no
     /// requests being processed by an attached backend.
-    pub(crate) struct NoneInFlight<'a> {
-        minder: &'a QueueMinder,
+    pub(crate) struct NoneInFlight<'a, DQ: DeviceQueue> {
+        minder: &'a QueueMinder<DQ>,
         #[pin]
         wait: Notified<'a>
     }
 }
-impl Future for NoneInFlight<'_> {
+impl<DQ: DeviceQueue> Future for NoneInFlight<'_, DQ> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

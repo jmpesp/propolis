@@ -30,29 +30,31 @@ struct SharedState {
 }
 
 impl SharedState {
-    fn processing_loop(&self, wctx: block::SyncWorkerCtx) {
-        while let Some(dreq) = wctx.block_for_req() {
-            let req = dreq.req();
-            if self.info.read_only && req.op.is_write() {
-                dreq.complete(block::Result::ReadOnly);
-                continue;
-            }
-            if req.op.is_discard() {
-                // Punt on discard support
-                dreq.complete(block::Result::Unsupported);
-                continue;
-            }
+    fn processing_loop<DQ: block::DeviceQueue>(&self, wctx: block::SyncWorkerCtx<DQ>) {
+        while let Some(dreqs) = wctx.block_for_req() {
+            for dreq in dreqs {
+                let req = dreq.req();
+                if self.info.read_only && req.op.is_write() {
+                    dreq.complete(block::Result::ReadOnly);
+                    continue;
+                }
+                if req.op.is_discard() {
+                    // Punt on discard support
+                    dreq.complete(block::Result::Unsupported);
+                    continue;
+                }
 
-            let res = match wctx
-                .acc_mem()
-                .access()
-                .and_then(|mem| self.process_request(&req, &mem).ok())
-            {
-                Some(_) => block::Result::Success,
-                None => block::Result::Failure,
-            };
+                let res = match wctx
+                    .acc_mem()
+                    .access()
+                    .and_then(|mem| self.process_request(&req, &mem).ok())
+                {
+                    Some(_) => block::Result::Success,
+                    None => block::Result::Failure,
+                };
 
-            dreq.complete(res);
+                dreq.complete(res);
+            }
         }
     }
 
@@ -133,7 +135,7 @@ impl InMemoryBackend {
         }))
     }
 
-    fn spawn_workers(&self, workers: &Arc<WorkerCollection>) -> Result<()> {
+    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) -> Result<()> {
         let count = self.worker_count.get();
         let spawn_results = (0..count).map(|n| {
             let shared_state = self.shared_state.clone();
@@ -153,7 +155,7 @@ impl InMemoryBackend {
 }
 
 #[async_trait::async_trait]
-impl block::Backend for InMemoryBackend {
+impl<DQ: block::DeviceQueue> block::Backend<DQ> for InMemoryBackend {
     fn info(&self) -> block::DeviceInfo {
         self.shared_state.info
     }
@@ -166,7 +168,7 @@ impl block::Backend for InMemoryBackend {
         true
     }
 
-    async fn start(&self, workers: &Arc<WorkerCollection>) -> anyhow::Result<()> {
+    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
         if let Err(e) = self.spawn_workers(workers) {
             self.workers.block_until_joined();
             Err(e).context("failure while spawning workers")
