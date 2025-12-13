@@ -1248,7 +1248,7 @@ fn setup_instance(
                     let log =
                         log.new(slog::o!("dev" => format!("nvme-{}", name)));
                     // Limit data transfers to 1MiB (2^8 * 4k) in size
-                    let mdts = Some(8);
+                    let mdts = Some(8); // XXX
 
                     let mut serial_number = [0u8; 20];
                     let sz = dev_serial.len().min(20);
