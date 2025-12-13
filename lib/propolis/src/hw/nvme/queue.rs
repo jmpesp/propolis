@@ -976,7 +976,7 @@ pub struct Permit {
 
 impl Permit {
     /// Consume the permit by placing an entry into the Completion Queue.
-    pub fn complete(self, comp: Completion) {
+    pub fn complete(self, comp: Completion) -> Option<Arc<CompQueue>> {
         let Permit { cq, sq, cid, _nodrop, .. } = self;
         std::mem::forget(_nodrop);
 
@@ -986,13 +986,13 @@ impl Permit {
                 // The CQ has since been deleted so no way to complete this
                 // request nor to return the permit.
                 debug_assert!(sq.upgrade().is_none());
-                return;
+                return None;
             }
         };
 
         if let Some(sq) = sq.upgrade() {
             cq.push(comp, cid, &sq);
-            cq.fire_interrupt();
+            return Some(cq.clone());
         } else {
             // The SQ has since been deleted (so the request has already
             // implicitly been aborted by the prior Delete Queue command) or
@@ -1001,6 +1001,7 @@ impl Permit {
             // Just make sure we return the "avail hold" from the permit
             let mut state = cq.state.lock();
             state.release_avail();
+            None
         }
     }
 

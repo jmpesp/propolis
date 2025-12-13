@@ -136,7 +136,7 @@ impl Result {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, PartialOrd, Ord)]
+#[derive(Hash, Copy, Clone, Eq, PartialEq, Debug, Default, PartialOrd, Ord)]
 pub struct QueueId(u8);
 impl QueueId {
     /// Arbitrary limit for per-device queues.

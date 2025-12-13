@@ -43,6 +43,8 @@ pub trait DeviceQueue: Send + Sync + 'static {
         result: block::Result,
         token: Self::Token,
     );
+
+    fn flush_notifications(&self);
 }
 
 /// A wrapper for an IO [Request] bearing necessary tracking information to
@@ -249,6 +251,8 @@ impl<DQ: DeviceQueue> QueueMinder<DQ> {
                 time_processed,
             );
         }
+
+        self.queue.flush_notifications();
 
         // We must track how many completions are being processed by the device,
         // since they are done outside the state lock, in order to present a

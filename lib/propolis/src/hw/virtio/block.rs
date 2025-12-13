@@ -269,6 +269,9 @@ impl block::DeviceQueue for BlockVq {
             self.0.push_used(chain, &mem);
         }
     }
+
+    fn flush_notifications(&self) {
+    }
 }
 
 impl VirtioDevice for PciVirtioBlock {

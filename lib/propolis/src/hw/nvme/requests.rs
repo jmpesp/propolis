@@ -2,13 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use super::{cmds::NvmCmd, queue::Permit, PciNvme};
 use crate::accessors::MemAccessor;
 use crate::block::{self, Operation, Request};
-use crate::hw::nvme::{bits, cmds::Completion, queue::SubQueue};
+use crate::hw::nvme::{bits, cmds::Completion, queue::SubQueue, CompQueue};
 
 #[usdt::provider(provider = "propolis")]
 mod probes {
@@ -37,13 +39,26 @@ impl block::Device<NvmeBlockQueue> for PciNvme {
     }
 }
 
+#[derive(Default)]
+pub struct NvmeBlockQueueNotificationState {
+    reqs: usize,
+    cqs_to_notify: HashMap<u16, Arc<CompQueue>>,
+}
+
 pub struct NvmeBlockQueue {
     sq: Arc<SubQueue>,
     acc_mem: MemAccessor,
+    state: Mutex<NvmeBlockQueueNotificationState>,
 }
 impl NvmeBlockQueue {
     pub(super) fn new(sq: Arc<SubQueue>, acc_mem: MemAccessor) -> Arc<Self> {
-        Arc::new(Self { sq, acc_mem })
+        Arc::new(Self {
+            sq,
+            acc_mem,
+            state: Mutex::new(
+                NvmeBlockQueueNotificationState::default(),
+            ),
+        })
     }
 }
 impl block::DeviceQueue for NvmeBlockQueue {
@@ -57,8 +72,8 @@ impl block::DeviceQueue for NvmeBlockQueue {
             return vec![];
         };
         let params = self.sq.params();
+        let mut reqs = Vec::with_capacity(65536); // XXX
 
-        let mut reqs = Vec::with_capacity(65536);
         while let Some((sub, permit, idx)) = sq.pop() {
             let qid = sq.id();
             probes::nvme_raw_cmd!(|| {
@@ -154,6 +169,29 @@ impl block::DeviceQueue for NvmeBlockQueue {
             }
         }
 
-        permit.complete(Completion::from(result));
+        let mut state = self.state.lock().unwrap();
+
+        if let Some(cq) = permit.complete(Completion::from(result)) {
+            if !state.cqs_to_notify.contains_key(&cq.id()) {
+                let old = state.cqs_to_notify.insert(cq.id(), cq);
+                assert!(old.is_none());
+            }
+            state.reqs += 1;
+        }
+
+        if state.reqs >= 4 { // XXX tune
+            for (_, cq) in state.cqs_to_notify.drain() {
+                cq.fire_interrupt();
+            }
+            state.reqs = 0;
+        }
+    }
+
+    fn flush_notifications(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (_, cq) in state.cqs_to_notify.drain() {
+            cq.fire_interrupt();
+        }
+        state.reqs = 0;
     }
 }
