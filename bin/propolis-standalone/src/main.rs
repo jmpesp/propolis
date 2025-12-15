@@ -2,6 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::File;
@@ -281,6 +287,14 @@ impl Instance {
             let _ = std::thread::Builder::new()
                 .name(format!("vcpu-{}", vcpu.id))
                 .spawn(move || {
+                    unsafe {
+                        processor_bind(
+                            idtype_P_LWPID,
+                            P_MYID,
+                            vcpu.id,
+                            std::ptr::null_mut(),
+                        );
+                    }
                     Instance::vcpu_loop(inner, vcpu.as_ref(), &task, task_log)
                 })
                 .unwrap();

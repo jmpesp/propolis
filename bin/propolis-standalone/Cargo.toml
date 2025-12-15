@@ -43,3 +43,7 @@ uuid.workspace = true
 [features]
 default = []
 crucible = ["propolis/crucible-full", "propolis/oximeter", "crucible-client-types"]
+
+[build-dependencies]
+bindgen = "0.71.0"
+
