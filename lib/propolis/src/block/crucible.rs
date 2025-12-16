@@ -395,11 +395,10 @@ impl<DQ: block::DeviceQueue> block::Backend<DQ> for CrucibleBackend {
         self.workers.push({
             let worker_state = self.state.clone();
             let wctx = workers.inactive_worker(n);
+            let wctx =
+                wctx.activate_async().expect("worker slot is uncontended");
 
             self.handle.spawn(async move {
-                let Some(wctx) = wctx.activate_async() else {
-                    return;
-                };
                 worker_state.process_loop(wctx, minder).await
             })
         });
