@@ -210,9 +210,17 @@ impl block::DeviceQueue for NvmeBlockQueue {
             }
         }
 
-        let mut state = self.state.lock().unwrap();
+
+        /*
+        // XXX uncomment to bypass this coalescing
+        if let Some(cq) = permit.complete(Completion::from(result)) {
+            cq.fire_interrupt();
+        }
+        */
 
         if let Some(cq) = permit.complete(Completion::from(result)) {
+            let mut state = self.state.lock().unwrap();
+
             if !state.cqs_to_notify.contains_key(&cq.id()) {
                 let old = state.cqs_to_notify.insert(cq.id(), cq);
                 assert!(old.is_none());
@@ -221,10 +229,11 @@ impl block::DeviceQueue for NvmeBlockQueue {
             state.reqs += 1;
 
             // XXX tune
-            if state.reqs > 16 || (Instant::now() - state.last).as_micros() >= 100 {
+            let now = Instant::now();
+            if state.reqs > 32 || (now - state.last).as_micros() >= 100 {
                 let to_notify = std::mem::take(&mut state.cqs_to_notify);
                 state.reqs = 0;
-                state.last = Instant::now();
+                state.last = now;
                 drop(state);
 
                 // XXX don't hold state lock when doing this!
