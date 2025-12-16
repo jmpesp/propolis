@@ -4,10 +4,10 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::accessors::MemAccessor;
 use crate::block;
+use crate::block::minder::DeviceQueueNextReqs;
 use crate::common::*;
 use crate::hw::pci;
 use crate::migrate::*;
@@ -122,8 +122,8 @@ pub struct CompletionToken {
 
 pub struct BlockVq(Arc<VirtQueue>, MemAccessor);
 impl BlockVq {
-    fn new(vq: Arc<VirtQueue>, acc_mem: MemAccessor) -> Arc<Self> {
-        Arc::new(Self(vq, acc_mem))
+    fn new(vq: Arc<VirtQueue>, acc_mem: MemAccessor) -> Self {
+        Self(vq, acc_mem)
     }
 }
 impl block::DeviceQueue for BlockVq {
@@ -131,15 +131,18 @@ impl block::DeviceQueue for BlockVq {
 
     fn next_reqs(
         &self,
-    ) -> Vec<(block::Request, Self::Token, Option<Instant>)> {
+    ) -> DeviceQueueNextReqs<Self::Token> {
         let vq = &self.0;
         let Some(mem) = self.1.access() else {
-            return vec![];
+            return DeviceQueueNextReqs::NoMem;
         };
 
         let mut reqs = Vec::with_capacity(65536);
+        let mut skipped = 0;
+
         loop {
             let mut chain = Chain::with_capacity(4);
+
             // Pop a request off the queue if there's one available.
             // For debugging purposes, we'll also use the returned index
             // as a psuedo-id for the request to associate it with its
@@ -227,6 +230,7 @@ impl block::DeviceQueue for BlockVq {
                         chain.write(&VIRTIO_BLK_S_UNSUPP, &mem);
                     }
                     vq.push_used(&mut chain, &mem);
+                    skipped += 1;
                 }
 
                 Ok(r) => {
@@ -234,7 +238,13 @@ impl block::DeviceQueue for BlockVq {
                 }
             }
         }
-        reqs
+
+        DeviceQueueNextReqs::Reqs {
+            reqs,
+            skipped,
+            stopped_could_not_reserve: false,
+            queue_empty: false,
+        }
     }
 
     fn complete(
@@ -331,7 +341,8 @@ impl Lifecycle for PciVirtioBlock {
     }
 
     async fn start(&self) -> anyhow::Result<()> {
-        self.block_attach.start().await
+        //self.block_attach.start().await
+        Ok(())
     }
 
     fn pause(&self) {

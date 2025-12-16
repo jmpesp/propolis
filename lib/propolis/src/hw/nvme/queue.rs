@@ -558,6 +558,16 @@ impl Drop for SubQueue {
     }
 }
 
+pub enum SubQueuePop {
+    NoMem,
+
+    Reqs {
+        sq_reqs: Vec<(GuestData<SubmissionQueueEntry>, Permit, u16)>,
+        stopped_could_not_reserve: bool,
+        queue_empty: bool,
+    },
+}
+
 impl SubQueue {
     /// Create a Submission Queue object backed by the guest memory at the
     /// given base address.
@@ -608,37 +618,69 @@ impl SubQueue {
         self.state.lock().num_occupied()
     }
 
-    /// Returns the next entry off of the Queue or [`None`] if it is empty.
+    /// Returns the next entries off of the Queue or [`None`] if it is empty.
     pub fn pop(
         self: &Arc<SubQueue>,
-    ) -> Option<(GuestData<SubmissionQueueEntry>, Permit, u16)> {
-        let Some(mem) = self.state.acc_mem.access() else { return None };
+    ) -> SubQueuePop {
+        let Some(mem) = self.state.acc_mem.access() else {
+            return SubQueuePop::NoMem;
+        };
 
-        // Attempt to reserve an entry on the Completion Queue
-        let permit = self.cq.reserve_entry(&self, &mem)?;
         let mut state = self.state.lock();
+        let mut cq_state = self.cq.state.lock();
 
         // Check for last-minute updates to the tail via any configured doorbell
         // page, prior to attempting the pop itself.
         state.db_buf_read(self.id, &mem);
 
-        if let Some(idx) = state.pop_head(&self.cur_head) {
-            let addr = self.base.offset::<SubmissionQueueEntry>(idx as usize);
+        let mut sq_reqs = Vec::with_capacity(65536); // XXX some max const
+        let mut stopped_could_not_reserve = false;
+        let mut queue_empty = false;
 
-            if let Some(ent) = mem.read::<SubmissionQueueEntry>(addr) {
-                state.db_buf_write(self.id, &mem);
-                state.db_buf_read(self.id, &mem);
-                return Some((ent, permit.promote(ent.cid()), idx));
+        loop {
+            // Attempt to reserve an entry on the Completion Queue
+            let Some(permit) = self.cq.reserve_entry(&mut cq_state, &self, &mem) else {
+                // Can't do any more!
+                stopped_could_not_reserve = true;
+                break;
+            };
+
+            match state.pop_head(&self.cur_head) {
+                Some(idx) => {
+                    let addr = self.base.offset::<SubmissionQueueEntry>(idx as usize);
+
+                    if let Some(ent) = mem.read::<SubmissionQueueEntry>(addr) {
+                        state.db_buf_write(self.id, &mem);
+                        state.db_buf_read(self.id, &mem);
+                        sq_reqs.push((ent, permit.promote(ent.cid()), idx));
+                    } else {
+                        eprintln!("BAD");
+                    }
+
+                    // TODO: set error state on queue/ctrl if we cannot read entry
+                }
+
+                None => {
+                    // queue empty
+                    queue_empty = true;
+
+                    // Drop lock on SQ before releasing permit (which locks CQ)
+                    drop(state);
+                    drop(cq_state);
+
+                    // No Submission Queue entry, so return the CQE permit
+                    permit.remit();
+
+                    break;
+                }
             }
-            // TODO: set error state on queue/ctrl if we cannot read entry
         }
 
-        // Drop lock on SQ before releasing permit (which locks CQ)
-        drop(state);
-
-        // No Submission Queue entry, so return the CQE permit
-        permit.remit();
-        None
+        SubQueuePop::Reqs {
+            sq_reqs,
+            stopped_could_not_reserve,
+            queue_empty,
+        }
     }
 
     /// Returns the ID of this Submission Queue.
@@ -796,10 +838,10 @@ impl CompQueue {
     /// An entry permit allows the user to push onto the Completion Queue.
     fn reserve_entry(
         self: &Arc<Self>,
+        state: &mut QueueGuard<'_, CompQueueState>,
         sq: &Arc<SubQueue>,
         mem: &MemCtx,
     ) -> Option<ProtoPermit> {
-        let mut state = self.state.lock();
         if !state.has_avail() {
             // If the CQ appears full, but the db_buf shadow is configured, do a
             // last-minute check to see if entries have been consumed/freed
@@ -976,6 +1018,7 @@ pub struct Permit {
 
 impl Permit {
     /// Consume the permit by placing an entry into the Completion Queue.
+    #[must_use]
     pub fn complete(self, comp: Completion) -> Option<Arc<CompQueue>> {
         let Permit { cq, sq, cid, _nodrop, .. } = self;
         std::mem::forget(_nodrop);

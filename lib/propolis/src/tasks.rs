@@ -425,6 +425,11 @@ impl TaskGroup {
         Self(Mutex::new(Vec::new()))
     }
 
+    pub fn push(&self, task: task::JoinHandle<()>) {
+        let mut guard = self.0.lock().unwrap();
+        guard.push(task);
+    }
+
     /// Add to the group of contained tasks
     pub fn extend<I>(&self, tasks: I)
     where
@@ -472,6 +477,11 @@ pub struct ThreadGroup(Mutex<Vec<thread::JoinHandle<()>>>);
 impl ThreadGroup {
     pub fn new() -> Self {
         Self(Mutex::new(Vec::new()))
+    }
+
+    pub fn push(&self, handle: thread::JoinHandle<()>) {
+        let mut guard = self.0.lock().unwrap();
+        guard.push(handle);
     }
 
     /// Add to group of contained threads

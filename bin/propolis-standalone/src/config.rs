@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 use std::os::unix::fs::FileTypeExt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -114,12 +113,10 @@ pub struct CloudInit {
 #[derive(Deserialize)]
 struct FileConfig {
     path: String,
-    workers: Option<NonZeroUsize>,
 }
 #[derive(Deserialize)]
 struct MemAsyncConfig {
     size: u64,
-    workers: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -159,9 +156,6 @@ fn opt_deser<'de, T: Deserialize<'de>>(
     Ok(config)
 }
 
-const DEFAULT_WORKER_COUNT: usize = 8;
-const MAX_FILE_WORKERS: usize = 32;
-
 pub fn block_backend<DQ: block::DeviceQueue>(
     config: &Config,
     dev: &Device,
@@ -196,24 +190,7 @@ pub fn block_backend<DQ: block::DeviceQueue>(
                     "path" => &parsed.path);
             }
 
-            let workers: NonZeroUsize = match parsed.workers {
-                Some(workers) => {
-                    if workers.get() <= MAX_FILE_WORKERS {
-                        workers
-                    } else {
-                        slog::warn!(
-                            log,
-                            "workers must be between 1 and {} \
-                            Using default value of {}.",
-                            MAX_FILE_WORKERS,
-                            DEFAULT_WORKER_COUNT,
-                        );
-                        NonZeroUsize::new(DEFAULT_WORKER_COUNT).unwrap()
-                    }
-                }
-                None => NonZeroUsize::new(DEFAULT_WORKER_COUNT).unwrap(),
-            };
-            block::FileBackend::create(&parsed.path, opts, workers).unwrap()
+            block::FileBackend::create(&parsed.path, opts).unwrap()
         }
         "crucible" => create_crucible_backend(be, opts, log),
         "crucible-mem" => create_crucible_mem_backend(be, opts, log),
@@ -223,10 +200,7 @@ pub fn block_backend<DQ: block::DeviceQueue>(
             block::MemAsyncBackend::create(
                 parsed.size,
                 opts,
-                NonZeroUsize::new(
-                    parsed.workers.unwrap_or(DEFAULT_WORKER_COUNT),
-                )
-                .unwrap(),
+                tokio::runtime::Handle::current(),
             )
             .unwrap()
         }

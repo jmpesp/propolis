@@ -10,7 +10,9 @@ use std::time::Instant;
 use super::{cmds::NvmCmd, queue::Permit, PciNvme};
 use crate::accessors::MemAccessor;
 use crate::block::{self, Operation, Request};
+use crate::block::minder::DeviceQueueNextReqs;
 use crate::hw::nvme::{bits, cmds::Completion, queue::SubQueue, CompQueue};
+use crate::hw::nvme::queue::SubQueuePop;
 
 #[usdt::provider(provider = "propolis")]
 mod probes {
@@ -39,9 +41,9 @@ impl block::Device<NvmeBlockQueue> for PciNvme {
     }
 }
 
-#[derive(Default)]
 pub struct NvmeBlockQueueNotificationState {
     reqs: usize,
+    last: Instant,
     cqs_to_notify: HashMap<u16, Arc<CompQueue>>,
 }
 
@@ -50,31 +52,51 @@ pub struct NvmeBlockQueue {
     acc_mem: MemAccessor,
     state: Mutex<NvmeBlockQueueNotificationState>,
 }
+
 impl NvmeBlockQueue {
-    pub(super) fn new(sq: Arc<SubQueue>, acc_mem: MemAccessor) -> Arc<Self> {
-        Arc::new(Self {
+    pub(super) fn new(sq: Arc<SubQueue>, acc_mem: MemAccessor) -> Self {
+        Self {
             sq,
             acc_mem,
             state: Mutex::new(
-                NvmeBlockQueueNotificationState::default(),
+                NvmeBlockQueueNotificationState {
+                    reqs: 0,
+                    last: Instant::now(),
+                    cqs_to_notify: Default::default(),
+                }
             ),
-        })
+        }
     }
 }
+
 impl block::DeviceQueue for NvmeBlockQueue {
     type Token = Permit;
 
     /// Pop an available I/O request off of the Submission Queue for hand-off to
     /// the underlying block backend
-    fn next_reqs(&self) -> Vec<(Request, Self::Token, Option<Instant>)> {
+    fn next_reqs(&self) -> DeviceQueueNextReqs<Self::Token> {
         let sq = &self.sq;
         let Some(mem) = self.acc_mem.access() else {
-            return vec![];
+            return DeviceQueueNextReqs::NoMem;
         };
         let params = self.sq.params();
-        let mut reqs = Vec::with_capacity(65536); // XXX
 
-        while let Some((sub, permit, idx)) = sq.pop() {
+        let mut reqs = Vec::with_capacity(65536); // XXX
+        let mut skipped = 0;
+
+        let (sq_reqs, stopped_could_not_reserve, queue_empty) = match sq.pop() {
+            SubQueuePop::NoMem => {
+                return DeviceQueueNextReqs::NoMem;
+            }
+
+            SubQueuePop::Reqs { sq_reqs, stopped_could_not_reserve, queue_empty } => {
+                (sq_reqs, stopped_could_not_reserve, queue_empty)
+            }
+        };
+
+        let mut cqs_to_notify: HashMap<u16, Arc<CompQueue>> = HashMap::new();
+
+        for (sub, permit, idx) in sq_reqs {
             let qid = sq.id();
             probes::nvme_raw_cmd!(|| {
                 (
@@ -94,10 +116,13 @@ impl block::DeviceQueue for NvmeBlockQueue {
                     let size = params.lba_data_size * (cmd.nlb as u64);
 
                     if size > params.max_data_tranfser_size {
-                        permit.complete(
+                        skipped += 1;
+                        let comp = 
                             Completion::generic_err(bits::STS_INVAL_FIELD)
-                                .dnr(),
-                        );
+                                .dnr();
+                        if let Some(cq) = permit.complete(comp) {
+                            cqs_to_notify.insert(cq.id(), cq);
+                        }
                         continue;
                     }
 
@@ -113,10 +138,13 @@ impl block::DeviceQueue for NvmeBlockQueue {
                     let size = params.lba_data_size * (cmd.nlb as u64);
 
                     if size > params.max_data_tranfser_size {
-                        permit.complete(
+                        skipped += 1;
+                        let comp =
                             Completion::generic_err(bits::STS_INVAL_FIELD)
-                                .dnr(),
-                        );
+                                .dnr();
+                        if let Some(cq) = permit.complete(comp) {
+                            cqs_to_notify.insert(cq.id(), cq);
+                        }
                         continue;
                     }
 
@@ -133,14 +161,27 @@ impl block::DeviceQueue for NvmeBlockQueue {
                     reqs.push((req, permit, None));
                 }
                 Ok(NvmCmd::Unknown(_)) | Err(_) => {
+                    skipped += 1;
                     // For any other unrecognized or malformed command,
                     // just immediately complete it with an error
                     let comp = Completion::generic_err(bits::STS_INTERNAL_ERR);
-                    permit.complete(comp);
+                    if let Some(cq) = permit.complete(comp) {
+                        cqs_to_notify.insert(cq.id(), cq);
+                    }
                 }
             }
         }
-        reqs
+
+        for (_, cq) in cqs_to_notify {
+            cq.fire_interrupt();
+        }
+
+        DeviceQueueNextReqs::Reqs {
+            reqs,
+            skipped,
+            stopped_could_not_reserve,
+            queue_empty,
+        }
     }
 
     /// Place the operation result (success or failure) onto the corresponding
@@ -176,22 +217,34 @@ impl block::DeviceQueue for NvmeBlockQueue {
                 let old = state.cqs_to_notify.insert(cq.id(), cq);
                 assert!(old.is_none());
             }
-            state.reqs += 1;
-        }
 
-        if state.reqs >= 4 { // XXX tune
-            for (_, cq) in state.cqs_to_notify.drain() {
-                cq.fire_interrupt();
+            state.reqs += 1;
+
+            // XXX tune
+            if state.reqs > 16 || (Instant::now() - state.last).as_micros() >= 100 {
+                let to_notify = std::mem::take(&mut state.cqs_to_notify);
+                state.reqs = 0;
+                state.last = Instant::now();
+                drop(state);
+
+                // XXX don't hold state lock when doing this!
+                for (_, cq) in to_notify {
+                    cq.fire_interrupt();
+                }
             }
-            state.reqs = 0;
         }
     }
 
     fn flush_notifications(&self) {
         let mut state = self.state.lock().unwrap();
-        for (_, cq) in state.cqs_to_notify.drain() {
+        let to_notify = std::mem::take(&mut state.cqs_to_notify);
+        state.reqs = 0;
+        state.last = Instant::now();
+        drop(state);
+
+        // XXX don't hold state lock when doing this!
+        for (_, cq) in to_notify {
             cq.fire_interrupt();
         }
-        state.reqs = 0;
     }
 }

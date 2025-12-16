@@ -1207,7 +1207,7 @@ fn setup_instance(
         let mut create_device = || -> anyhow::Result<()> {
             match driver {
                 "pci-virtio-block" => {
-                    let (backend, name) =
+                    let (backend, _name) =
                         config::block_backend(&config, dev, log);
                     let bdf = bdf.unwrap();
 

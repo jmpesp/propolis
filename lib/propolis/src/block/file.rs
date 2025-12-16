@@ -4,21 +4,19 @@
 
 use std::fs::{metadata, File, OpenOptions};
 use std::io::{Error, ErrorKind, Result};
-use std::num::NonZeroUsize;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::block::{self, SyncWorkerCtx, WorkerId};
+use crate::block::{self, SyncWorkerCtx, QueueMinder};
 use crate::block::attachment::WorkerCollection;
+use crate::block::attachment::WorkerMessage;
+use crate::block::minder::QueueMinderNextReqs;
 use crate::tasks::ThreadGroup;
 use crate::vmm::{MappingExt, MemCtx};
 
-use anyhow::Context;
-
 pub struct FileBackend {
     state: Arc<SharedState>,
-    worker_count: NonZeroUsize,
     workers: ThreadGroup,
 }
 struct SharedState {
@@ -57,8 +55,37 @@ impl SharedState {
         Arc::new(state)
     }
 
-    fn processing_loop<DQ: block::DeviceQueue>(&self, wctx: SyncWorkerCtx<DQ>) {
-        while let Some(dreqs) = wctx.block_for_req() {
+    fn processing_loop<DQ: block::DeviceQueue>(
+        &self,
+        wctx: SyncWorkerCtx,
+        minder: Arc<QueueMinder<DQ>>,
+    ) {
+        loop {
+            let dreqs = match wctx.block_for_req() {
+                WorkerMessage::WakeUpForRequests { hint } => {
+                    let (dreqs, skipped) = match minder.next_reqs() {
+                        QueueMinderNextReqs::Reqs { dreqs, skipped } => {
+                            (dreqs, skipped)
+                        }
+
+                        QueueMinderNextReqs::NoMem => {
+                            break;
+                        }
+                    };
+
+                    if let Some(hint) = hint {
+                        assert!(hint.get() >= skipped);
+                        assert_eq!(dreqs.len(), hint.get() - skipped);
+                    }
+
+                    dreqs
+                }
+
+                WorkerMessage::Stop | WorkerMessage::Disconnected => {
+                    break;
+                }
+            };
+
             for dreq in dreqs {
                 let req = dreq.req();
                 if self.info.read_only && req.op.is_write() {
@@ -159,7 +186,6 @@ impl FileBackend {
     pub fn create(
         path: impl AsRef<Path>,
         opts: block::BackendOpts,
-        worker_count: NonZeroUsize,
     ) -> Result<Arc<Self>> {
         let p: &Path = path.as_ref();
 
@@ -203,30 +229,10 @@ impl FileBackend {
                 wce_state,
                 disk_info.discard_mech,
             ),
-            worker_count,
             workers: ThreadGroup::new(),
         }))
     }
 
-    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) -> std::io::Result<()> {
-        let spawn_results = (0..self.worker_count.get())
-            .map(|n| {
-                let shared_state = self.state.clone();
-                let wctx = workers.inactive_worker(n as WorkerId);
-
-                std::thread::Builder::new()
-                    .name(format!("file worker {n}"))
-                    .spawn(move || {
-                        let wctx = wctx
-                            .activate_sync()
-                            .expect("worker slot is uncontended");
-                        shared_state.processing_loop(wctx);
-                    })
-            })
-            .collect::<Vec<_>>();
-
-        self.workers.extend(spawn_results.into_iter())
-    }
 }
 
 #[async_trait::async_trait]
@@ -235,21 +241,34 @@ impl<DQ: block::DeviceQueue> block::Backend<DQ> for FileBackend {
         self.state.info
     }
 
-    fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
+    async fn start(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
-    fn synchronous(&self) -> bool {
-        true
-    }
+    fn spawn(
+        &self,
+        workers: &Arc<WorkerCollection>,
+        n: block::WorkerId,
+        minder: Arc<QueueMinder<DQ>>,
+    ) -> anyhow::Result<()> {
+        self.workers.push({
+            let shared_state = self.state.clone();
+            let wctx = workers.inactive_worker(n);
+            let wctx = wctx
+                .activate_sync()
+                .expect("worker slot is uncontended");
 
-    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
-        if let Err(e) = self.spawn_workers(workers) {
-            self.workers.block_until_joined();
-            Err(e).context("failure while spawning workers")
-        } else {
-            Ok(())
-        }
+            // XXX comment about activate outside is load bearing for notify
+            // racing after queue associate
+
+            std::thread::Builder::new()
+                .name(format!("file worker {n}"))
+                .spawn(move || {
+                    shared_state.processing_loop(wctx, minder);
+                })?
+        });
+
+        Ok(())
     }
 
     async fn stop(&self) -> () {

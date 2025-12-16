@@ -5,12 +5,14 @@
 //! Implement a virtual block device backed by Crucible
 
 use std::io;
-use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::block;
 use crate::block::attachment::WorkerCollection;
+use crate::block::attachment::WorkerMessage;
+use crate::block::QueueMinder;
+use crate::block::minder::QueueMinderNextReqs;
 use crate::tasks::TaskGroup;
 use crate::vmm::MemCtx;
 
@@ -26,12 +28,10 @@ use uuid::Uuid;
 
 pub use nexus_client::Client as NexusClient;
 
-// TODO: Make this a runtime tunable?
-const WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
-
 pub struct CrucibleBackend {
     state: Arc<WorkerState>,
     workers: TaskGroup,
+    handle: tokio::runtime::Handle,
 }
 struct WorkerState {
     volume: Volume,
@@ -39,14 +39,40 @@ struct WorkerState {
     skip_flush: bool,
 }
 impl WorkerState {
-    async fn process_loop<DQ: block::DeviceQueue>(&self, wctx: block::AsyncWorkerCtx<DQ>) {
+    async fn process_loop<DQ: block::DeviceQueue>(
+        &self,
+        wctx: block::AsyncWorkerCtx,
+        minder: Arc<QueueMinder<DQ>>,
+    ) {
         // Start with a read buffer of a single block
         // It will be resized larger (and remain so) if subsequent read
         // operations required additional space.
         let mut readbuf = Buffer::new(1, self.info.block_size as usize);
+
         loop {
-            let Some(dreqs) = wctx.next_req().await else {
-                break;
+            let dreqs = match wctx.next_req().await {
+                WorkerMessage::WakeUpForRequests { hint } => {
+                    let (dreqs, skipped) = match minder.next_reqs() {
+                        QueueMinderNextReqs::Reqs { dreqs, skipped } => {
+                            (dreqs, skipped)
+                        }
+
+                        QueueMinderNextReqs::NoMem => {
+                            break;
+                        }
+                    };
+
+                    if let Some(hint) = hint {
+                        assert!(hint.get() >= skipped);
+                        assert_eq!(dreqs.len(), hint.get() - skipped);
+                    }
+
+                    dreqs
+                }
+
+                WorkerMessage::Stop | WorkerMessage::Disconnected => {
+                    break;
+                }
             };
 
             for dreq in dreqs {
@@ -230,6 +256,7 @@ impl CrucibleBackend {
                 skip_flush: opts.skip_flush.unwrap_or(false),
             }),
             workers: TaskGroup::new(),
+            handle: tokio::runtime::Handle::current(),
         }))
     }
 
@@ -281,6 +308,7 @@ impl CrucibleBackend {
                 skip_flush: opts.skip_flush.unwrap_or(false),
             }),
             workers: TaskGroup::new(),
+            handle: tokio::runtime::Handle::current(),
         }))
     }
 
@@ -342,21 +370,6 @@ impl CrucibleBackend {
             .map_err(CrucibleError::into)
     }
 
-    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) {
-        let max_workers = WORKER_COUNT.get();
-        self.workers.extend((0..max_workers).map(|n| {
-            let worker_state = self.state.clone();
-            let wctx = workers.inactive_worker(n);
-
-            tokio::spawn(async move {
-                let Some(wctx) = wctx.activate_async() else {
-                    return;
-                };
-                worker_state.process_loop(wctx).await
-            })
-        }))
-    }
-
     pub async fn volume_is_active(&self) -> Result<bool, CrucibleError> {
         self.state.volume.query_is_active().await
     }
@@ -368,17 +381,29 @@ impl<DQ: block::DeviceQueue> block::Backend<DQ> for CrucibleBackend {
         self.state.info
     }
 
-    fn worker_count(&self) -> NonZeroUsize {
-        WORKER_COUNT
-    }
-
-    fn synchronous(&self) -> bool {
-        false
-    }
-
-    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
+    async fn start(&self) -> anyhow::Result<()> {
         self.state.volume.activate().await?;
-        self.spawn_workers(workers);
+        Ok(())
+    }
+
+    fn spawn(
+        &self,
+        workers: &Arc<WorkerCollection>,
+        n: block::WorkerId,
+        minder: Arc<QueueMinder<DQ>>,
+    ) -> anyhow::Result<()> {
+        self.workers.push({
+            let worker_state = self.state.clone();
+            let wctx = workers.inactive_worker(n);
+
+            self.handle.spawn(async move {
+                let Some(wctx) = wctx.activate_async() else {
+                    return;
+                };
+                worker_state.process_loop(wctx, minder).await
+            })
+        });
+
         Ok(())
     }
 

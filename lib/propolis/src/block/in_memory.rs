@@ -3,11 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::io::{Error, ErrorKind, Result};
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::block;
+use crate::block::QueueMinder;
 use crate::block::attachment::WorkerCollection;
+use crate::block::attachment::WorkerMessage;
+use crate::block::minder::QueueMinderNextReqs;
 use crate::common::Lifecycle;
 use crate::migrate::{
     MigrateCtx, MigrateSingle, MigrateStateError, Migrator, PayloadOffer,
@@ -16,12 +18,9 @@ use crate::migrate::{
 use crate::tasks::ThreadGroup;
 use crate::vmm::{MemCtx, SubMapping};
 
-use anyhow::Context;
-
 pub struct InMemoryBackend {
     shared_state: Arc<SharedState>,
     workers: ThreadGroup,
-    worker_count: NonZeroUsize,
 }
 
 struct SharedState {
@@ -30,8 +29,37 @@ struct SharedState {
 }
 
 impl SharedState {
-    fn processing_loop<DQ: block::DeviceQueue>(&self, wctx: block::SyncWorkerCtx<DQ>) {
-        while let Some(dreqs) = wctx.block_for_req() {
+    fn processing_loop<DQ: block::DeviceQueue>(
+        &self,
+        wctx: block::SyncWorkerCtx,
+        minder: Arc<QueueMinder<DQ>>,
+    ) {
+        loop {
+            let dreqs = match wctx.block_for_req() {
+                WorkerMessage::WakeUpForRequests { hint } => {
+                    let (dreqs, skipped) = match minder.next_reqs() {
+                        QueueMinderNextReqs::Reqs { dreqs, skipped } => {
+                            (dreqs, skipped)
+                        }
+
+                        QueueMinderNextReqs::NoMem => {
+                            break;
+                        }
+                    };
+
+                    if let Some(hint) = hint {
+                        assert!(hint.get() >= skipped);
+                        assert_eq!(dreqs.len(), hint.get() - skipped);
+                    }
+
+                    dreqs
+                }
+
+                WorkerMessage::Stop | WorkerMessage::Disconnected => {
+                    break;
+                }
+            };
+
             for dreq in dreqs {
                 let req = dreq.req();
                 if self.info.read_only && req.op.is_write() {
@@ -103,7 +131,6 @@ impl InMemoryBackend {
     pub fn create(
         bytes: Vec<u8>,
         opts: block::BackendOpts,
-        worker_count: NonZeroUsize,
     ) -> Result<Arc<Self>> {
         let block_size = opts.block_size.unwrap_or(block::DEFAULT_BLOCK_SIZE);
 
@@ -131,26 +158,7 @@ impl InMemoryBackend {
         Ok(Arc::new(Self {
             shared_state: Arc::new(SharedState { bytes, info }),
             workers: ThreadGroup::new(),
-            worker_count,
         }))
-    }
-
-    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) -> Result<()> {
-        let count = self.worker_count.get();
-        let spawn_results = (0..count).map(|n| {
-            let shared_state = self.shared_state.clone();
-            let wctx = workers.inactive_worker(n);
-            std::thread::Builder::new()
-                .name(format!("in-memory worker {n}"))
-                .spawn(move || {
-                    let wctx = wctx
-                        .activate_sync()
-                        .expect("worker slot is uncontended");
-                    shared_state.processing_loop(wctx);
-                })
-        });
-
-        self.workers.extend(spawn_results.into_iter())
     }
 }
 
@@ -160,21 +168,30 @@ impl<DQ: block::DeviceQueue> block::Backend<DQ> for InMemoryBackend {
         self.shared_state.info
     }
 
-    fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
+    async fn start(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
-    fn synchronous(&self) -> bool {
-        true
-    }
+    fn spawn(
+        &self,
+        workers: &Arc<WorkerCollection>,
+        n: block::WorkerId,
+        minder: Arc<QueueMinder<DQ>>,
+    ) -> anyhow::Result<()> {
+        self.workers.push({
+            let shared_state = self.shared_state.clone();
+            let wctx = workers.inactive_worker(n);
+            std::thread::Builder::new()
+                .name(format!("in-memory worker {n}"))
+                .spawn(move || {
+                    let wctx = wctx
+                        .activate_sync()
+                        .expect("worker slot is uncontended");
+                    shared_state.processing_loop(wctx, minder);
+                })?
+        });
 
-    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
-        if let Err(e) = self.spawn_workers(workers) {
-            self.workers.block_until_joined();
-            Err(e).context("failure while spawning workers")
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     async fn stop(&self) -> () {

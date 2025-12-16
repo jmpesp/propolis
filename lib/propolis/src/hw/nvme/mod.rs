@@ -7,6 +7,7 @@ use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::HashMap;
 
 use crate::accessors::Guard;
 use crate::block;
@@ -17,6 +18,7 @@ use crate::hw::pci;
 use crate::migrate::*;
 use crate::util::regmap::RegMap;
 use crate::vmm::MemAccessed;
+use crate::hw::nvme::queue::SubQueuePop;
 
 use futures::future::BoxFuture;
 use lazy_static::lazy_static;
@@ -1159,7 +1161,7 @@ impl PciNvme {
             cq.notify_head(val)?;
 
             // If this CQ was previously full, SQs may have become corked while
-            // trying to get permits.  Notify them that there may now be
+            // trying to get permits. Notify them that there may now be
             // capacity.
             let Some(to_notify) = cq.kick() else {
                 // No associated SQs to notify about
@@ -1233,8 +1235,17 @@ impl PciNvme {
             // XXX: set controller error state?
         }
         let mem = mem.unwrap();
+        let mut cqs_to_notify: HashMap<u16, Arc<CompQueue>> = HashMap::new();
 
-        while let Some((sub, permit, _idx)) = sq.pop() {
+        let sq_reqs = match sq.pop() {
+            SubQueuePop::NoMem => {
+                panic!("set controller error state");
+            }
+
+            SubQueuePop::Reqs { sq_reqs, .. } => sq_reqs
+        };
+
+        for (sub, permit, _idx) in sq_reqs {
             use cmds::AdminCmd;
 
             probes::nvme_admin_cmd!(|| (sub.opcode(), sub.prp1, sub.prp2));
@@ -1247,6 +1258,7 @@ impl PciNvme {
                 // reacting in the same manner as unknown command?
                 AdminCmd::Unknown(sub)
             });
+
             let comp = match cmd {
                 AdminCmd::Abort(cmd) => state.acmd_abort(&cmd),
                 AdminCmd::CreateIOCompQ(cmd) => {
@@ -1287,11 +1299,16 @@ impl PciNvme {
                 }
             };
 
-            permit.complete(comp);
+            if let Some(cq) = permit.complete(comp) {
+                cqs_to_notify.insert(cq.id(), cq);
+            }
         }
 
         // Notify for any newly added completions
         cq.fire_interrupt();
+        for (_, cq) in cqs_to_notify {
+            cq.fire_interrupt();
+        }
 
         Ok(())
     }

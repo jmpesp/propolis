@@ -4,13 +4,12 @@
 
 //! Implements an interface to virtualized block devices.
 
-use std::time::Duration;
 use std::sync::Arc;
-use std::num::NonZeroUsize;
+use std::time::Duration;
 
+use crate::block::attachment::WorkerCollection;
 use crate::common::*;
 use crate::vmm::{MemCtx, SubMapping};
-use crate::block::attachment::WorkerCollection;
 
 mod file;
 pub use file::FileBackend;
@@ -30,7 +29,7 @@ pub mod attachment;
 pub mod minder;
 
 pub use attachment::{AsyncWorkerCtx, DeviceAttachment, SyncWorkerCtx};
-pub use minder::{DeviceQueue, DeviceRequest};
+pub use minder::{DeviceQueue, DeviceRequest, QueueMinder};
 
 pub type ByteOffset = usize;
 pub type ByteLen = usize;
@@ -268,14 +267,8 @@ pub trait Device<DQ: DeviceQueue>: Send + Sync + 'static {
 /// to process [Request]s posted by the guest.
 #[async_trait::async_trait]
 pub trait Backend<DQ: DeviceQueue>: Send + Sync + 'static {
-    // XXX
+    // XXX comment required
     fn info(&self) -> DeviceInfo;
-
-    // XXX
-    fn worker_count(&self) -> NonZeroUsize;
-
-    // XXX
-    fn synchronous(&self) -> bool;
 
     /// Start attempting to process [Request]s from [Device] (if attached) XXX
     ///
@@ -292,7 +285,16 @@ pub trait Backend<DQ: DeviceQueue>: Send + Sync + 'static {
     /// prior to dropping the backend. This routine is, however, guaranteed to
     /// be called before the VM's vCPUs are started.
     ///
-    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()>;
+    async fn start(&self) -> anyhow::Result<()>;
+
+    /// Spawn a worker to handle this QueueMinder. If sync, then spawns a
+    /// thread. If async, then spawns a tokio task using the registered runtime.
+    fn spawn(
+        &self,
+        workers: &Arc<WorkerCollection>,
+        n: WorkerId,
+        minder: Arc<QueueMinder<DQ>>,
+    ) -> anyhow::Result<()>;
 
     /// Stop attempting to process new [Request]s from [Device] (if attached)
     ///

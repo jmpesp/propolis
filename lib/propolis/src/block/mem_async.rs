@@ -3,12 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::io::{Error, ErrorKind, Result};
-use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::block;
+use crate::block::QueueMinder;
 use crate::block::attachment::WorkerCollection;
+use crate::block::attachment::WorkerMessage;
+use crate::block::minder::QueueMinderNextReqs;
 use crate::tasks::TaskGroup;
 use crate::vmm::MemCtx;
 
@@ -20,15 +22,47 @@ use crate::vmm::MemCtx;
 pub struct MemAsyncBackend {
     shared_state: Arc<SharedState>,
     workers: TaskGroup,
-    worker_count: NonZeroUsize,
+    handle: tokio::runtime::Handle,
 }
 struct SharedState {
     seg: MmapSeg,
     info: block::DeviceInfo,
 }
 impl SharedState {
-    async fn processing_loop<DQ: block::DeviceQueue>(&self, wctx: block::AsyncWorkerCtx<DQ>) {
-        while let Some(dreqs) = wctx.next_req().await {
+    async fn processing_loop<DQ: block::DeviceQueue>(
+        &self,
+        wctx: block::AsyncWorkerCtx,
+        minder: Arc<QueueMinder<DQ>>,
+    ) {
+        loop {
+            let dreqs = match wctx.next_req().await {
+                WorkerMessage::WakeUpForRequests { hint: _hint } => {
+                    let (dreqs, _skipped) = match minder.next_reqs() {
+                        QueueMinderNextReqs::Reqs { dreqs, skipped } => {
+                            (dreqs, skipped)
+                        }
+
+                        QueueMinderNextReqs::NoMem => {
+                            break;
+                        }
+                    };
+
+                    /*
+                    // XXX why doesn't this work?
+                    if let Some(hint) = hint {
+                        assert!(hint.get() >= skipped);
+                        assert_eq!(dreqs.len(), hint.get() - skipped);
+                    }
+                    */
+
+                    dreqs
+                }
+
+                WorkerMessage::Stop | WorkerMessage::Disconnected => {
+                    break;
+                }
+            };
+
             for dreq in dreqs {
                 dreq.complete(block::Result::Success);
                 continue;
@@ -108,7 +142,7 @@ impl MemAsyncBackend {
     pub fn create(
         size: u64,
         opts: block::BackendOpts,
-        worker_count: NonZeroUsize,
+        handle: tokio::runtime::Handle,
     ) -> Result<Arc<Self>> {
         let block_size = opts.block_size.unwrap_or(block::DEFAULT_BLOCK_SIZE);
 
@@ -135,20 +169,7 @@ impl MemAsyncBackend {
         Ok(Arc::new(Self {
             shared_state: Arc::new(SharedState { info, seg }),
             workers: TaskGroup::new(),
-            worker_count,
-        }))
-    }
-
-    fn spawn_workers<DQ: block::DeviceQueue>(&self, workers: &Arc<WorkerCollection<DQ>>) {
-        let count = self.worker_count.get();
-        self.workers.extend((0..count).map(|n| {
-            let shared_state = self.shared_state.clone();
-            let wctx = workers.inactive_worker(n);
-            tokio::spawn(async move {
-                let wctx =
-                    wctx.activate_async().expect("worker slot is uncontended");
-                shared_state.processing_loop(wctx).await
-            })
+            handle,
         }))
     }
 }
@@ -159,16 +180,27 @@ impl<DQ: block::DeviceQueue> block::Backend<DQ> for MemAsyncBackend {
         self.shared_state.info
     }
 
-    fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
+    async fn start(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
-    fn synchronous(&self) -> bool {
-        false
-    }
+    fn spawn(
+        &self,
+        workers: &Arc<WorkerCollection>,
+        n: block::WorkerId,
+        minder: Arc<QueueMinder<DQ>>,
+    ) -> anyhow::Result<()> {
+        self.workers.push({
+            let shared_state = self.shared_state.clone();
+            let wctx = workers.inactive_worker(n);
+            let wctx =
+                wctx.activate_async().expect("worker slot is uncontended");
 
-    async fn start(&self, workers: &Arc<WorkerCollection<DQ>>) -> anyhow::Result<()> {
-        self.spawn_workers(workers);
+            self.handle.spawn(async move {
+                shared_state.processing_loop(wctx, minder).await
+            })
+        });
+
         Ok(())
     }
 

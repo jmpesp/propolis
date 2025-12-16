@@ -4,7 +4,6 @@
 
 //! Mechanisms required to implement a block device
 
-use std::any::Any;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -20,6 +19,17 @@ use tokio::sync::Notify;
 use crate::block::{self, devq_id, probes, Operation, Request};
 use crate::block::{DeviceId, MetricConsumer, QueueId};
 
+pub enum DeviceQueueNextReqs<Token: Send + Sync + 'static> {
+    NoMem,
+
+    Reqs {
+        reqs: Vec<(Request, Token, Option<Instant>)>,
+        skipped: usize,
+        stopped_could_not_reserve: bool,
+        queue_empty: bool,
+    },
+}
+
 /// Each emulated block device will have one or more [DeviceQueue]s which can be
 /// polled through [next_req()](DeviceQueue::next_req()) to emit IO requests.
 /// The completions for those requests are then processed through
@@ -33,7 +43,7 @@ pub trait DeviceQueue: Send + Sync + 'static {
     /// Get the next [Request] (if any) from this queue.  Supporting data
     /// included with the request consists of the necessary [Self::Token] as
     /// well an optional [queued-time](Instant).
-    fn next_reqs(&self) -> Vec<(Request, Self::Token, Option<Instant>)>;
+    fn next_reqs(&self) -> DeviceQueueNextReqs<Self::Token>;
 
     /// Emit a completion for a processed request, identified by its
     /// [token](Self::Token).
@@ -117,8 +127,8 @@ impl<T: Send + Sync + 'static> Default for QmInner<T> {
     }
 }
 
-pub(super) struct QueueMinder<DQ: DeviceQueue> {
-    queue: Arc<DQ>,
+pub struct QueueMinder<DQ: DeviceQueue> {
+    queue: DQ,
     pub queue_id: QueueId,
     pub device_id: DeviceId,
     state: Mutex<QmInner<DQ::Token>>,
@@ -126,9 +136,18 @@ pub(super) struct QueueMinder<DQ: DeviceQueue> {
     notify: Notify,
 }
 
+pub enum QueueMinderNextReqs<DQ: DeviceQueue> {
+    NoMem,
+
+    Reqs {
+        dreqs: Vec<DeviceRequest<DQ>>,
+        skipped: usize,
+    }
+}
+
 impl<DQ: DeviceQueue> QueueMinder<DQ> {
     pub fn new(
-        queue: Arc<DQ>,
+        queue: DQ,
         device_id: DeviceId,
         queue_id: QueueId,
     ) -> Arc<Self> { // XXX needs to be Arc for NoneProcessing?
@@ -139,17 +158,25 @@ impl<DQ: DeviceQueue> QueueMinder<DQ> {
             state: Mutex::new(QmInner::default()),
             self_ref: self_ref.clone(),
             notify: Notify::new(),
-            //next_req_fn,
-            //complete_req_fn,
         })
     }
 
     /// Attempt to fetch the next IO request from this queue for a worker.
-    pub fn next_reqs(&self) -> Vec<DeviceRequest<DQ>> {
-        let mut dreqs = Vec::with_capacity(65536);
-        let reqs = self.queue.next_reqs();
+    pub fn next_reqs(&self) -> QueueMinderNextReqs<DQ> {
+        let (reqs, skipped) = match self.queue.next_reqs() {
+            DeviceQueueNextReqs::NoMem => {
+                return QueueMinderNextReqs::NoMem;
+            }
+
+            DeviceQueueNextReqs::Reqs { reqs, skipped, .. } => {
+                (reqs, skipped)
+            }
+        };
 
         let mut state = self.state.lock().unwrap();
+
+        let mut dreqs = Vec::with_capacity(65536);
+
         for (req, token, when_queued) in reqs {
             let id = state.next_id;
             state.next_id.advance();
@@ -189,7 +216,11 @@ impl<DQ: DeviceQueue> QueueMinder<DQ> {
 
             dreqs.push(DeviceRequest::new(id, req, self.self_ref.clone()))
         }
-        dreqs
+
+        QueueMinderNextReqs::Reqs {
+            dreqs,
+            skipped,
+        }
     }
 
     /// Process a completion for an in-flight IO request on this queue.
@@ -252,8 +283,6 @@ impl<DQ: DeviceQueue> QueueMinder<DQ> {
             );
         }
 
-        self.queue.flush_notifications();
-
         // We must track how many completions are being processed by the device,
         // since they are done outside the state lock, in order to present a
         // reliably accurate accurate signal of when the device has no more
@@ -262,6 +291,7 @@ impl<DQ: DeviceQueue> QueueMinder<DQ> {
             let mut state = self.state.lock().unwrap();
             state.processing_last -= 1;
             if state.in_flight.is_empty() && state.processing_last == 0 {
+                self.queue.flush_notifications();
                 self.notify.notify_waiters();
             }
         }
