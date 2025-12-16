@@ -140,7 +140,7 @@ pub struct QueueId(u8);
 impl QueueId {
     /// Arbitrary limit for per-device queues.
     /// Sized to match [attachment::Bitmap] capacity
-    pub const MAX_QUEUES: usize = 64;
+    pub const MAX_QUEUES: usize = 1024;
 
     pub const MAX: Self = Self(Self::MAX_QUEUES as u8);
 }

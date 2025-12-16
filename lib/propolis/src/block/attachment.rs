@@ -38,7 +38,7 @@ use pin_project_lite::pin_project;
 /// Static for generating unique block [DeviceId]s with a process
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(0);
 
-pub const MAX_WORKERS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+pub const MAX_WORKERS: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 pub type ReqCountHint = Option<NonZeroUsize>;
 

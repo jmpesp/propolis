@@ -149,7 +149,7 @@ struct CtrlState {
 
 /// The max number of completion or submission queues we support.
 /// Note: This includes the admin completion/submission queues.
-const MAX_NUM_QUEUES: usize = 16;
+const MAX_NUM_QUEUES: usize = 1024;
 
 /// The max number of I/O completion or submission queues we support.
 /// Always 1 less than the total number w/ the admin queues.
@@ -167,10 +167,10 @@ struct NvmeCtrl {
     msix_hdl: Option<pci::MsixHdl>,
 
     /// The list of Completion Queues handled by the controller
-    cqs: [Option<Arc<CompQueue>>; MAX_NUM_QUEUES],
+    cqs: Vec<Option<Arc<CompQueue>>>,
 
     /// The list of Submission Queues handled by the controller
-    sqs: [Option<Arc<SubQueue>>; MAX_NUM_QUEUES],
+    sqs: Vec<Option<Arc<SubQueue>>>,
 
     /// The Identify structure returned for Identify controller commands
     ctrl_ident: IdentifyController,
@@ -656,12 +656,31 @@ impl NvmeCtrl {
     }
 }
 
-#[derive(Default)]
 struct NvmeQueues {
-    sqs: [Mutex<Option<Arc<SubQueue>>>; MAX_NUM_QUEUES],
-    cqs: [Mutex<Option<Arc<CompQueue>>>; MAX_NUM_QUEUES],
+    sqs: Vec<Mutex<Option<Arc<SubQueue>>>>,
+    cqs: Vec<Mutex<Option<Arc<CompQueue>>>>,
 }
+
 impl NvmeQueues {
+    fn new() -> Self {
+        NvmeQueues {
+            sqs: {
+                let mut x = Vec::with_capacity(MAX_NUM_QUEUES);
+                for _ in 0..MAX_NUM_QUEUES {
+                    x.push(Mutex::new(None));
+                }
+                x
+            },
+            cqs: {
+                let mut x = Vec::with_capacity(MAX_NUM_QUEUES);
+                for _ in 0..MAX_NUM_QUEUES {
+                    x.push(Mutex::new(None));
+                }
+                x
+            },
+        }
+    }
+
     /// Replace the contents of a [SubQueue] slot.
     fn set_sq_slot(&self, sqid: QueueId, queue: Option<Arc<SubQueue>>) {
         let replace_some = queue.is_some();
@@ -856,8 +875,20 @@ impl PciNvme {
             ctrl: CtrlState { cap, cc, csts, ..Default::default() },
             doorbell_buf: None,
             msix_hdl: None,
-            cqs: Default::default(),
-            sqs: Default::default(),
+            cqs: {
+                let mut x = Vec::with_capacity(MAX_NUM_QUEUES);
+                for _ in 0..MAX_NUM_QUEUES {
+                    x.push(None);
+                }
+                x
+            },
+            sqs: {
+                let mut x = Vec::with_capacity(MAX_NUM_QUEUES);
+                for _ in 0..MAX_NUM_QUEUES {
+                    x.push(None);
+                }
+                x
+            },
             ctrl_ident,
             ns_ident,
         };
@@ -882,7 +913,7 @@ impl PciNvme {
             state: Mutex::new(state),
             is_enabled: AtomicBool::new(false),
             pci_state,
-            queues: NvmeQueues::default(),
+            queues: NvmeQueues::new(),
             block_attach,
             log,
         })
